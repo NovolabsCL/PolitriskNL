@@ -93,43 +93,22 @@ button[kind="header"]{background:rgba(184,137,26,0.2)!important;border:1px solid
 .ob-lbl{color:var(--gold);}.re-lbl{color:var(--silver);}
 .efa-box{background:#F3F5F8;border-left:3px solid var(--blue);padding:.7rem .9rem;border-radius:2px;margin:.7rem 0;font-size:.76rem;color:#1B2F4E;line-height:1.65;}
 .sb-s{font-size:.58rem!important;text-transform:uppercase!important;letter-spacing:.15em!important;color:var(--gold)!important;font-weight:600!important;margin-bottom:.35rem!important;}
-footer{display:none!important;}#MainMenu{display:none!important;}header{display:none!important;}.stDeployButton{display:none!important;}
+footer{display:none!important;}
+#MainMenu{display:none!important;}
+.stDeployButton{display:none!important;}
+/* Hacemos el encabezado transparente para no arruinar el diseño, pero lo dejamos vivo para el celular */
+header{background:transparent!important;}
 
-/* ── BOTÓN TOGGLE SIDEBAR — todas las versiones de Streamlit ── */
+/* ── BOTÓN NATIVO SIDEBAR (PC Y MÓVIL) ── */
 [data-testid="collapsedControl"],
-[data-testid="stSidebarCollapseButton"],
-button[aria-label="Close sidebar"],
-button[aria-label="Open sidebar"],
-button[aria-label="Collapse sidebar"],
-button[aria-label="Expand sidebar"],
-.css-1rs6os, .css-17ziqus, .css-fblp2m {
-    background: var(--gold) !important;
-    border-radius: 0 6px 6px 0 !important;
-    width: 2rem !important;
-    height: 2.5rem !important;
-    border: none !important;
-    cursor: pointer !important;
-    position: fixed !important;
-    top: 50% !important;
-    left: 0 !important;
-    z-index: 9999 !important;
-    display: flex !important;
-    align-items: center !important;
-    justify-content: center !important;
-    box-shadow: 2px 0 8px rgba(0,0,0,0.4) !important;
+[data-testid="stHeader"] button {
+    color: var(--gold) !important;
+    background-color: transparent !important;
 }
 [data-testid="collapsedControl"] svg,
-[data-testid="stSidebarCollapseButton"] svg,
-button[aria-label="Open sidebar"] svg,
-button[aria-label="Expand sidebar"] svg {
-    fill: var(--navy) !important;
-    color: var(--navy) !important;
-    width: 16px !important;
-    height: 16px !important;
-}
-/* Cuando el sidebar está expandido, mover el botón */
-[data-testid="stSidebar"][aria-expanded="true"] ~ * [data-testid="collapsedControl"] {
-    left: 0 !important;
+[data-testid="stHeader"] button svg {
+    fill: var(--gold) !important;
+    color: var(--gold) !important;
 }
 </style>
 """, unsafe_allow_html=True)
