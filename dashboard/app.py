@@ -14,6 +14,7 @@ from engine.financial        import calculate_efa, calculate_rar, format_usd
 from engine.recommendations  import generate, conditions_by_category
 from data.all_countries      import ALL_COUNTRIES, ISO3_TO_NAME
 from config                  import SECTORS, ASSET_TYPES
+from connectors.gemini_agent import generate_specialized_report
 
 st.set_page_config(page_title="PolitRisk Pro", page_icon="🌐",
                    layout="wide", initial_sidebar_state="expanded")
@@ -450,6 +451,61 @@ else:
                         pl="Obligatoria" if c.priority=="obligatoria" else "Recomendada"
                         lc="ob-lbl" if c.priority=="obligatoria" else "re-lbl"
                         st.markdown(f'<div class="ci {cls}"><div><span class="ci-prio {lc}">{pl}</span> <span class="ci-main">{c.text}</span></div><div class="ci-rat">{c.rationale}</div></div>',unsafe_allow_html=True)
+                        with col_n:
+            st.markdown('<p style="font-size:.60rem;text-transform:uppercase;letter-spacing:.12em;color:#98A6B5;font-weight:600;margin-bottom:.4rem;">Notas del Analista</p>',unsafe_allow_html=True)
+            kn=f"{irp.country}_{irp.sector}"
+            notes=st.text_area("Notas",value=st.session_state.analyst_notes.get(kn,""),height=220,placeholder="Contexto cualitativo, ajustes, supuestos...",label_visibility="collapsed")
+            st.session_state.analyst_notes[kn]=notes
+            st.markdown(f'<div style="margin-top:.8rem;padding:.7rem;background:#F3F5F8;border-radius:2px;font-size:.68rem;color:#98A6B5;line-height:1.55;"><strong style="color:#0F1E35;display:block;margin-bottom:.2rem;">Plazo de revisión</strong>{rec.review_schedule}</div>',unsafe_allow_html=True)
+
+        # ── BOTÓN Y GENERADOR DE GEMINI AI ──
+        st.markdown("<hr style='border-color:#E4E9F0;margin:1.5rem 0;'>", unsafe_allow_html=True)
+        st.markdown('<p class="sb-s" style="font-size:.70rem!important;color:#B8891A!important;">🤖 Generador de Investigación Científica (APA 7)</p>', unsafe_allow_html=True)
+        
+        report_key = f"ai_report_{irp.country}_{irp.sector}"
+        
+        if st.button("Generar Reporte Especializado con Gemini", key=f"btn_gemini_{irp.country}_{irp.sector}"):
+            with st.spinner("Gemini está procesando la bibliografía y redactando la investigación... (puede tardar 30-60 segundos)"):
+                raw_summary = f"IRP Score: {irp.irp_score}\nNivel de Riesgo: {rl(irp.risk_level)}\nCobertura de datos: {irp.data_coverage_pct}%\n"
+                
+                reporte_ai = generate_specialized_report(
+                    country=irp.country,
+                    sector=SECTORS.get(irp.sector, irp.sector),
+                    irp_score=irp.irp_score or 0,
+                    efa_usd=efa.efa_usd if efa else 0,
+                    raw_data_summary=raw_summary
+                )
+                st.session_state[report_key] = reporte_ai
+        
+        if st.session_state.get(report_key):
+            st.markdown("<div style='background-color: #F3F5F8; padding: 1.5rem; border-left: 4px solid #B8891A; border-radius: 4px; margin-top: 1rem;'>", unsafe_allow_html=True)
+            st.markdown(st.session_state[report_key])
+            st.markdown("</div>", unsafe_allow_html=True)
+                        # --- SECCIÓN DEL AGENTE GEMINI AI ---
+            st.markdown("<div style='height:1.5rem'></div>", unsafe_allow_html=True)
+            st.markdown('<p class="sb-s" style="font-size:.70rem!important;">🤖 Generador de Investigación Científica (APA 7)</p>', unsafe_allow_html=True)
+            
+            report_key = f"ai_report_{irp.country}_{irp.sector}"
+            
+            if st.button("Generar Reporte Especializado con Gemini", key=f"btn_gemini_{irp.country}_{irp.sector}"):
+                with st.spinner("Gemini está procesando la bibliografía y redactando la investigación... (puede tardar 30-60 segundos)"):
+                    # Construir un resumen de contexto para el agente
+                    raw_summary = f"IRP Score: {irp.irp_score}\nNivel de Riesgo: {rl(irp.risk_level)}\nCobertura de datos: {irp.data_coverage_pct}%\n"
+                    
+                    reporte_ai = generate_specialized_report(
+                        country=irp.country,
+                        sector=SECTORS.get(irp.sector, irp.sector),
+                        irp_score=irp.irp_score or 0,
+                        efa_usd=efa.efa_usd if efa else 0,
+                        raw_data_summary=raw_summary
+                    )
+                    st.session_state[report_key] = reporte_ai
+            
+            # Mostrar el reporte si ya está guardado en la sesión
+            if st.session_state.get(report_key):
+                st.markdown("<div style='background-color: #F3F5F8; padding: 1.5rem; border-left: 4px solid #B8891A; border-radius: 4px; margin-top: 1rem;'>", unsafe_allow_html=True)
+                st.markdown(st.session_state[report_key])
+                st.markdown("</div>", unsafe_allow_html=True)
         with col_n:
             st.markdown('<p style="font-size:.60rem;text-transform:uppercase;letter-spacing:.12em;color:#98A6B5;font-weight:600;margin-bottom:.4rem;">Notas del Analista</p>',unsafe_allow_html=True)
             kn=f"{irp.country}_{irp.sector}"
