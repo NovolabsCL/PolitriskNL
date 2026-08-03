@@ -1,0 +1,3617 @@
+==> ./connectors/__init__.py <==
+
+==> ./connectors/world_bank.py <==
+# connectors/world_bank.py
+# Siempre baja el dato más reciente disponible para cada indicador.
+# Retorna {valor, año} para que el sistema sepa exactamente
+# qué año se está usando en cada dato.
+# ─────────────────────────────────────────────────────────────────
+
+import time
+from typing import Optional, Tuple
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+
+WB_INDICATORS = {
+    "POL_01": "CC.EST",
+    "POL_02": "RL.EST",
+    "POL_03": "PV.EST",
+    "POL_04": "GE.EST",
+    "POL_05": "RQ.EST",
+    "ECO_04": "FI.RES.TOTL.MO",
+    "BIZ_01": "IC.BUS.EASE.XQ",
+    "BIZ_02": "IC.PRT.INVS.XQ",
+    "BIZ_03": "IC.REG.DURS",
+    "BIZ_04": "HD.HCI.OVRL",
+    "BIZ_05": "LP.LPI.OVRL.XQ",
+    "BIZ_06": "IT.NET.USER.ZS",
+    "OPP_01": "NY.GDP.PCAP.CD",
+}
+
+HEADERS  = {"User-Agent": "PolitRiskPro/2.0", "Accept": "application/json"}
+MAX_YEAR = 2024   # año más reciente a intentar
+LOOKBACK = 8      # cuántos años hacia atrás buscar
+
+
+def _fetch(url: str) -> Optional[dict]:
+    if not REQUESTS_AVAILABLE:
+        return None
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15, verify=True)
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+def fetch_indicator(iso2: str, wb_code: str) -> Tuple[Optional[float], Optional[int]]:
+    """
+    Baja el dato más reciente disponible para un indicador.
+    Retorna (valor, año) o (None, None) si no hay dato.
+    """
+    year_from = MAX_YEAR - LOOKBACK
+    url = (
+        f"https://api.worldbank.org/v2/country/{iso2}"
+        f"/indicator/{wb_code}"
+        f"?format=json&date={year_from}:{MAX_YEAR}"
+        f"&per_page={LOOKBACK + 1}"
+    )
+    data = _fetch(url)
+    if not data or len(data) < 2 or not data[1]:
+        return None, None
+
+    # Resultados vienen de más reciente a más antiguo
+    for entry in data[1]:
+        if entry.get("value") is not None:
+            return round(float(entry["value"]), 4), int(entry["date"])
+
+    return None, None
+
+
+def fetch_all(country_iso2: str) -> dict:
+    """
+    Baja todos los indicadores del Banco Mundial.
+    Retorna: {"POL_01": {"value": 0.97, "year": 2023, "source": "World Bank"}, ...}
+    """
+    results = {}
+    for code, wb_code in WB_INDICATORS.items():
+        value, year = fetch_indicator(country_iso2, wb_code)
+        results[code] = {"value": value, "year": year, "source": "World Bank"}
+        time.sleep(0.25)
+    return results
+
+==> ./connectors/orchestrator.py <==
+# connectors/orchestrator.py
+from datetime import datetime
+from data.all_countries import get_country
+from connectors import world_bank, imf, yahoo_finance
+
+def fetch_automatic_data(country_name: str) -> dict:
+    country      = get_country(country_name)
+    iso2         = country["iso2"]
+    fx_pair      = country.get("fx_pair")
+    current_year = datetime.now().year
+
+    wb_data  = world_bank.fetch_all(iso2)
+    imf_data = imf.fetch_all(iso2)
+
+    volatility = yahoo_finance.fetch_fx_volatility(fx_pair)
+    fx_current = yahoo_finance.fetch_fx_current(fx_pair)
+    fx_range   = yahoo_finance.fetch_fx_range_12m(fx_pair)
+
+    fx_entry = {"value": volatility, "year": current_year, "source": "Yahoo Finance"}
+
+    all_data = {**wb_data, **imf_data, "ECO_07": fx_entry}
+    all_data["_fx_pair"]    = fx_pair
+    all_data["_fx_current"] = fx_current
+    all_data["_fx_range"]   = fx_range
+    return all_data
+
+==> ./connectors/imf.py <==
+# connectors/imf.py
+# Siempre baja el dato más reciente del FMI WEO.
+# Retorna {valor, año} para trazabilidad completa.
+# ─────────────────────────────────────────────────────────────────
+
+import time
+from typing import Optional, Tuple
+
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+
+IMF_INDICATORS = {
+    "ECO_01": "PCPIPCH",
+    "ECO_02": "NGDP_RPCH",
+    "ECO_03": "GGXWDG_NGDP",
+    "ECO_08": "BCA_NGDPD",
+}
+
+HEADERS  = {"User-Agent": "PolitRiskPro/2.0", "Accept": "application/json"}
+MAX_YEAR = 2024
+LOOKBACK = 5
+
+
+def _fetch(url: str) -> Optional[dict]:
+    if not REQUESTS_AVAILABLE:
+        return None
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=20, verify=True)
+        return r.json() if r.status_code == 200 else None
+    except Exception:
+        return None
+
+
+def fetch_indicator(iso2: str, imf_code: str) -> Tuple[Optional[float], Optional[int]]:
+    """
+    Baja el dato más reciente del FMI para un indicador.
+    Retorna (valor, año) o (None, None).
+    """
+    url  = f"https://www.imf.org/external/datamapper/api/v1/{imf_code}/{iso2}"
+    data = _fetch(url)
+    if not data:
+        return None, None
+
+    valores = (
+        data.get("values", {})
+            .get(imf_code, {})
+            .get(iso2, {})
+    )
+
+    # Busca de más reciente a más antiguo
+    for y in range(MAX_YEAR, MAX_YEAR - LOOKBACK - 1, -1):
+        v = valores.get(str(y))
+        if v is not None:
+            return round(float(v), 4), y
+
+    return None, None
+
+
+def fetch_all(country_iso2: str) -> dict:
+    """
+    Baja todos los indicadores del FMI.
+    Retorna: {"ECO_01": {"value": 11.6, "year": 2022, "source": "IMF WEO"}, ...}
+    """
+    results = {}
+    for code, imf_code in IMF_INDICATORS.items():
+        value, year = fetch_indicator(country_iso2, imf_code)
+        results[code] = {"value": value, "year": year, "source": "IMF WEO"}
+        time.sleep(0.3)
+    return results
+
+==> ./connectors/yahoo_finance.py <==
+# connectors/yahoo_finance.py
+# Conector a Yahoo Finance para tipos de cambio y volatilidad cambiaria.
+# Actualización: diaria.
+# No requiere API key.
+# ─────────────────────────────────────────────────────────────────
+
+from typing import Optional, Tuple
+from datetime import datetime, timedelta
+
+try:
+    import yfinance as yf
+    YF_AVAILABLE = True
+except ImportError:
+    YF_AVAILABLE = False
+
+
+def fetch_fx_volatility(fx_pair: str) -> Optional[float]:
+    """
+    Calcula la volatilidad del tipo de cambio en los últimos 12 meses.
+
+    Fórmula: (Máximo - Mínimo) / Promedio del período
+    Resultado: valor entre 0 y 1 (ej: 0.22 = 22% de fluctuación)
+
+    Args:
+        fx_pair: par de divisas en formato Yahoo Finance
+                 Ej: "CLPUSD=X", "BRLUSD=X", "EURUSD=X"
+
+    Returns:
+        volatilidad como float (0-1) o None si no hay datos
+    """
+    if not YF_AVAILABLE:
+        return None
+    if fx_pair is None:
+        return 0.0   # país dolarizado, sin volatilidad cambiaria
+
+    try:
+        end   = datetime.today()
+        start = end - timedelta(days=365)
+
+        ticker = yf.Ticker(fx_pair)
+        hist   = ticker.history(start=start, end=end)
+
+        if hist.empty or len(hist) < 30:
+            return None
+
+        prices  = hist["Close"]
+        maximo  = float(prices.max())
+        minimo  = float(prices.min())
+        promedio= float(prices.mean())
+
+        if promedio == 0:
+            return None
+
+        volatilidad = (maximo - minimo) / promedio
+        return round(volatilidad, 4)
+
+    except Exception:
+        return None
+
+
+def fetch_fx_current(fx_pair: str) -> Optional[float]:
+    """
+    Obtiene el tipo de cambio actual (precio de cierre más reciente).
+
+    Args:
+        fx_pair: par en formato Yahoo Finance (ej: "CLPUSD=X")
+
+    Returns:
+        precio actual o None
+    """
+    if not YF_AVAILABLE or fx_pair is None:
+        return None
+
+    try:
+        ticker = yf.Ticker(fx_pair)
+        hist   = ticker.history(period="5d")
+        if hist.empty:
+            return None
+        return round(float(hist["Close"].iloc[-1]), 6)
+    except Exception:
+        return None
+
+
+def fetch_fx_range_12m(fx_pair: str) -> Optional[Tuple[float, float, float]]:
+    """
+    Retorna (mínimo, máximo, promedio) del tipo de cambio en 12 meses.
+    Útil para el análisis de exposición financiera.
+    """
+    if not YF_AVAILABLE or fx_pair is None:
+        return None
+
+    try:
+        end   = datetime.today()
+        start = end - timedelta(days=365)
+
+        ticker = yf.Ticker(fx_pair)
+        hist   = ticker.history(start=start, end=end)
+
+        if hist.empty:
+            return None
+
+        prices = hist["Close"]
+        return (
+            round(float(prices.min()), 6),
+            round(float(prices.max()), 6),
+            round(float(prices.mean()), 6),
+        )
+    except Exception:
+        return None
+
+==> ./fix_sidebar.py <==
+content = open('dashboard/app.py').read()
+content = 
+content.replace('[data-testid="collapsedControl"]{background:var(--gold)!important;border-radius:0 
+4px 4px 0!important;}', '')
+content = content.replace('[data-testid="collapsedControl"] 
+svg{fill:var(--navy)!important;}', '')
+open('dashboard/app.py', 'w').write(content)
+print('Listo')
+
+
+==> ./config.py <==
+# config.py
+# Configuración global de PolitRisk Pro v2
+# ─────────────────────────────────────────
+
+APP_NAME    = "PolitRisk Pro"
+APP_VERSION = "2.0"
+
+# Umbrales del Índice de Riesgo Político (IRP)
+IRP_THRESHOLDS = {
+    "viable":       70,   # IRP >= 70 → VIABLE
+    "conditioned":  40,   # IRP >= 40 → CONDICIONADO
+                          # IRP <  40 → NO VIABLE
+}
+
+# Colores por nivel de riesgo (para dashboard y reportes)
+RISK_COLORS = {
+    "viable":      "#1E7D5A",   # verde oscuro
+    "conditioned": "#C8991A",   # dorado
+    "not_viable":  "#A93226",   # rojo oscuro
+}
+
+# Paleta corporativa
+PALETTE = {
+    "navy":        "#1B2A4A",
+    "blue":        "#2E5FA3",
+    "gold":        "#C8991A",
+    "light_gray":  "#F4F6F9",
+    "mid_gray":    "#8395A7",
+    "dark_gray":   "#2C3E50",
+    "white":       "#FFFFFF",
+    "green":       "#1E7D5A",
+    "red":         "#A93226",
+    "orange":      "#C8991A",
+}
+
+# Sectores disponibles
+SECTORS = {
+    "mining":      "Minería Extractiva",
+    "renewable":   "Energía Renovable",
+    "infra":       "Infraestructura",
+    "tech":        "Tecnología & Startups",
+}
+
+# Ponderaciones por sector (deben sumar 1.0)
+SECTOR_WEIGHTS = {
+    "mining": {
+        "political":   0.35,
+        "economic":    0.25,
+        "business":    0.15,
+        "social":      0.20,
+        "opportunity": 0.05,
+    },
+    "renewable": {
+        "political":   0.30,
+        "economic":    0.22,
+        "business":    0.18,
+        "social":      0.18,
+        "opportunity": 0.12,
+    },
+    "infra": {
+        "political":   0.28,
+        "economic":    0.22,
+        "business":    0.20,
+        "social":      0.18,
+        "opportunity": 0.12,
+    },
+    "tech": {
+        "political":   0.15,
+        "economic":    0.18,
+        "business":    0.32,
+        "social":      0.10,
+        "opportunity": 0.25,
+    },
+}
+
+# Tipos de activo (para lógica de recomendación)
+ASSET_TYPES = {
+    "fixed":      "Activo fijo inamovible (mina, planta, puerto)",
+    "semi_fixed": "Activo semi-fijo (manufactura, planta energía)",
+    "mobile":     "Activo móvil (tech, servicios, retail)",
+}
+
+==> ./dashboard/__init__.py <==
+
+==> ./dashboard/app.py <==
+# dashboard/app.py — PolitRisk Pro v2
+# streamlit run dashboard/app.py
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+from datetime import datetime
+import io, contextlib, sys, os
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from connectors.orchestrator import fetch_automatic_data
+from engine.scoring          import ScoringEngine
+from engine.financial        import calculate_efa, calculate_rar, format_usd
+from engine.recommendations  import generate, conditions_by_category
+from data.all_countries      import ALL_COUNTRIES, ISO3_TO_NAME
+from config                  import SECTORS, ASSET_TYPES
+
+st.set_page_config(page_title="PolitRisk Pro", page_icon="🌐",
+                   layout="wide", initial_sidebar_state="expanded")
+
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600&family=DM+Serif+Display&family=DM+Mono:wght@400;500&display=swap');
+:root{--navy:#0F1E35;--navy-mid:#1B2F4E;--blue:#2451A0;--gold:#B8891A;--gold-lt:#D4A843;
+      --silver:#8395A7;--g100:#F3F5F8;--g200:#E4E9F0;--g400:#98A6B5;
+      --white:#FFFFFF;--green:#1A6B4A;--red:#8C1F1F;}
+html,body,[class*="css"]{font-family:'DM Sans',sans-serif!important;color:var(--navy)!important;}
+.stApp{background:var(--navy)!important;}
+
+/* ── SIDEBAR VISIBLE ── */
+[data-testid="stSidebar"]{background:var(--navy-mid)!important;border-right:1px solid #2A4060!important;}
+[data-testid="stSidebar"] *{color:var(--g200)!important;}
+[data-testid="stSidebar"] label{color:var(--g400)!important;font-size:.67rem!important;
+  text-transform:uppercase!important;letter-spacing:.09em!important;font-weight:500!important;}
+[data-testid="stSidebar"] .stSelectbox>div>div{background:#0F1E35!important;
+  border:1px solid #2A4060!important;border-radius:3px!important;}
+[data-testid="stSidebar"] hr{border-color:#2A4060!important;margin:.8rem 0!important;}
+[data-testid="stSidebar"] .stButton>button{background:var(--gold)!important;
+  color:var(--navy)!important;border:none!important;font-weight:600!important;
+  font-size:.78rem!important;letter-spacing:.07em!important;text-transform:uppercase!important;
+  padding:.6rem 1rem!important;border-radius:3px!important;width:100%!important;}
+/* Botón de toggle del sidebar — hacerlo visible */
+button[kind="header"]{background:rgba(184,137,26,0.2)!important;border:1px solid var(--gold)!important;}
+
+/* ── TABS ── */
+.stTabs [data-baseweb="tab-list"]{background:#1B2F4E!important;border-radius:4px 4px 0 0!important;gap:2px!important;padding:4px 4px 0!important;}
+.stTabs [data-baseweb="tab"]{background:transparent!important;color:var(--g400)!important;border:none!important;border-radius:3px 3px 0 0!important;font-size:.70rem!important;font-weight:500!important;letter-spacing:.06em!important;text-transform:uppercase!important;padding:.5rem .85rem!important;}
+.stTabs [aria-selected="true"]{background:var(--white)!important;color:var(--navy)!important;font-weight:600!important;}
+.stTabs [data-baseweb="tab-panel"]{background:var(--white)!important;border:1px solid var(--g200)!important;border-top:none!important;border-radius:0 0 4px 4px!important;padding:1.2rem!important;}
+
+/* ── COMPONENTES ── */
+.app-hdr{display:flex;justify-content:space-between;align-items:center;padding:.8rem 1.5rem;background:var(--navy);border-bottom:1px solid #2A4060;margin-bottom:0;}
+.app-brand{font-family:'DM Serif Display',serif;font-size:1.1rem;color:var(--white);margin:0;}
+.app-brand span{color:var(--gold);}
+.app-meta{font-size:.63rem;color:var(--silver);font-family:'DM Mono',monospace;letter-spacing:.06em;}
+.kpi{background:var(--white);border:1px solid var(--g200);border-top:3px solid var(--navy);padding:.9rem 1.1rem;border-radius:2px;}
+.kpi.g{border-top-color:var(--green);}.kpi.y{border-top-color:var(--gold);}.kpi.r{border-top-color:var(--red);}
+.kpi-lbl{font-size:.58rem;text-transform:uppercase;letter-spacing:.11em;color:var(--silver);font-weight:600;margin-bottom:.25rem;}
+.kpi-val{font-family:'DM Serif Display',serif;font-size:1.7rem;color:var(--navy);line-height:1;margin-bottom:.12rem;}
+.kpi-sub{font-size:.62rem;color:var(--silver);font-family:'DM Mono',monospace;}
+.vbadge{display:inline-block;padding:.2rem .6rem;border-radius:2px;font-size:.65rem;font-weight:600;letter-spacing:.09em;text-transform:uppercase;}
+.vb-v{background:#E8F5EE;color:var(--green);border:1px solid #A8D5BC;}
+.vb-c{background:#FDF8EC;color:#8C6010;border:1px solid #E8C97A;}
+.vb-n{background:#FAEAEA;color:var(--red);border:1px solid #D4A0A0;}
+.map-legend{display:flex;gap:1.2rem;align-items:center;justify-content:center;padding:.5rem 0;}
+.li{display:flex;align-items:center;gap:.4rem;font-size:.63rem;color:var(--silver);font-family:'DM Mono',monospace;}
+.ld{width:10px;height:10px;border-radius:50%;flex-shrink:0;}
+.click-hint{text-align:center;font-size:.72rem;color:var(--silver);padding:.3rem 0 .1rem;font-family:'DM Mono',monospace;letter-spacing:.05em;}
+.country-selected{background:#1B2F4E;border:1px solid var(--gold);border-radius:4px;padding:.8rem 1.2rem;margin-bottom:.8rem;display:flex;justify-content:space-between;align-items:center;}
+.cs-name{font-family:'DM Serif Display',serif;font-size:1.1rem;color:var(--white);}
+.cs-meta{font-size:.65rem;color:var(--silver);font-family:'DM Mono',monospace;}
+.ind-row{display:flex;align-items:center;padding:.35rem 0;border-bottom:1px solid var(--g100);gap:.45rem;}
+.ind-code{font-family:'DM Mono',monospace;font-size:.61rem;color:var(--silver);width:46px;flex-shrink:0;}
+.ind-name{font-size:.72rem;color:var(--navy);flex:1;line-height:1.3;}
+.ind-ya{font-family:'DM Mono',monospace;font-size:.61rem;color:#8C6010;width:34px;text-align:center;flex-shrink:0;background:#FDF8EC;border-radius:2px;padding:1px 3px;}
+.ind-ym{font-family:'DM Mono',monospace;font-size:.61rem;color:var(--g400);width:34px;text-align:center;flex-shrink:0;}
+.ind-sc{font-family:'DM Mono',monospace;font-size:.72rem;font-weight:500;width:32px;text-align:right;flex-shrink:0;}
+.ind-bb{width:60px;height:3px;background:var(--g200);border-radius:2px;flex-shrink:0;overflow:hidden;}
+.ind-bf{height:100%;border-radius:2px;}
+.ind-na{font-family:'DM Mono',monospace;font-size:.61rem;color:var(--g400);}
+.rec-text{font-size:.80rem;line-height:1.75;color:#1B2F4E;margin:0;}
+.cond-cat{font-size:.58rem;text-transform:uppercase;letter-spacing:.14em;color:var(--silver);font-weight:600;margin:.9rem 0 .35rem;}
+.ci{padding:.5rem .75rem;margin-bottom:.28rem;border-radius:2px;}
+.ci.ob{background:#FDF8EC;border-left:3px solid var(--gold);}
+.ci.re{background:var(--g100);border-left:3px solid var(--g400);}
+.ci-main{font-size:.78rem;color:var(--navy);font-weight:500;line-height:1.3;}
+.ci-rat{font-size:.70rem;color:var(--silver);margin-top:.2rem;line-height:1.4;font-style:italic;}
+.ci-prio{font-size:.58rem;text-transform:uppercase;letter-spacing:.08em;font-weight:600;}
+.ob-lbl{color:var(--gold);}.re-lbl{color:var(--silver);}
+.efa-box{background:#F3F5F8;border-left:3px solid var(--blue);padding:.7rem .9rem;border-radius:2px;margin:.7rem 0;font-size:.76rem;color:#1B2F4E;line-height:1.65;}
+.sb-s{font-size:.58rem!important;text-transform:uppercase!important;letter-spacing:.15em!important;color:var(--gold)!important;font-weight:600!important;margin-bottom:.35rem!important;}
+footer{display:none!important;}#MainMenu{display:none!important;}header{display:none!important;}.stDeployButton{display:none!important;}
+
+/* ── BOTÓN TOGGLE SIDEBAR — todas las versiones de Streamlit ── */
+[data-testid="collapsedControl"],
+[data-testid="stSidebarCollapseButton"],
+button[aria-label="Close sidebar"],
+button[aria-label="Open sidebar"],
+button[aria-label="Collapse sidebar"],
+button[aria-label="Expand sidebar"],
+.css-1rs6os, .css-17ziqus, .css-fblp2m {
+    background: var(--gold) !important;
+    border-radius: 0 6px 6px 0 !important;
+    width: 2rem !important;
+    height: 2.5rem !important;
+    border: none !important;
+    cursor: pointer !important;
+    position: fixed !important;
+    top: 50% !important;
+    left: 0 !important;
+    z-index: 9999 !important;
+    display: flex !important;
+    align-items: center !important;
+    justify-content: center !important;
+    box-shadow: 2px 0 8px rgba(0,0,0,0.4) !important;
+}
+[data-testid="collapsedControl"] svg,
+[data-testid="stSidebarCollapseButton"] svg,
+button[aria-label="Open sidebar"] svg,
+button[aria-label="Expand sidebar"] svg {
+    fill: var(--navy) !important;
+    color: var(--navy) !important;
+    width: 16px !important;
+    height: 16px !important;
+}
+/* Cuando el sidebar está expandido, mover el botón */
+[data-testid="stSidebar"][aria-expanded="true"] ~ * [data-testid="collapsedControl"] {
+    left: 0 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ── ESTADO ───────────────────────────────────────────────────────
+if "analyses"       not in st.session_state: st.session_state.analyses       = {}
+if "analyst_notes"  not in st.session_state: st.session_state.analyst_notes  = {}
+if "clicked_country"not in st.session_state: st.session_state.clicked_country= None
+engine = ScoringEngine()
+
+# ── HELPERS ──────────────────────────────────────────────────────
+def sc(s):
+    if s is None: return "#98A6B5"
+    if s>=70: return "#1A6B4A"
+    if s>=55: return "#B8891A"
+    if s>=40: return "#C05A1A"
+    return "#8C1F1F"
+def rl(lvl): return {"viable":"Viable","conditioned":"Condicionado","not_viable":"No Viable","insufficient_data":"Insuficiente"}.get(lvl,"—")
+def rb(lvl): return {"viable":"vb-v","conditioned":"vb-c","not_viable":"vb-n"}.get(lvl,"vb-c")
+def kc(lvl): return {"viable":"g","conditioned":"y","not_viable":"r"}.get(lvl,"")
+
+# ── SIDEBAR ───────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown('<div style="padding:1.2rem 1rem .8rem;border-bottom:1px solid #2A4060;margin-bottom:1.2rem;"><p style="font-family:\'DM Serif Display\',serif;font-size:1.1rem;color:white;margin:0;">PolitRisk <span style=\'color:#B8891A\'>Pro</span></p><p style="font-size:.60rem;color:#8395A7;text-transform:uppercase;letter-spacing:.13em;margin-top:.15rem;">Configuración del Análisis</p></div>', unsafe_allow_html=True)
+
+    st.markdown('<p class="sb-s">País y Sector</p>', unsafe_allow_html=True)
+
+    # Si se hizo clic en el mapa, preseleccionar ese país
+    default_country = st.session_state.clicked_country or "Chile"
+    country_list = sorted(ALL_COUNTRIES.keys())
+    default_idx  = country_list.index(default_country) if default_country in country_list else 0
+
+    country    = st.selectbox("País de destino", country_list, index=default_idx)
+    sector     = st.selectbox("Sector", list(SECTORS.keys()), format_func=lambda x: SECTORS[x])
+    a_year     = st.selectbox("Año de referencia del informe",
+                               [2026,2025,2024,2023,2022,2021,2020], index=0,
+                               help="Los datos automáticos usan siempre el año más reciente disponible")
+    asset_type = st.selectbox("Tipo de activo", list(ASSET_TYPES.keys()),
+                               format_func=lambda x: ASSET_TYPES[x].split("(")[0].strip())
+    st.markdown("---")
+
+    st.markdown('<p class="sb-s">Dimensión Política</p>', unsafe_allow_html=True)
+    p06=st.slider("V-Dem EDI (0–1)",0.0,1.0,0.79,0.01,help="vdem.net")
+    p07=st.slider("Freedom House (0–100)",0.0,100.0,75.0,1.0,help="freedomhouse.org")
+    p08=st.slider("Conflicto UCDP (0–10)",0.0,10.0,2.0,0.5,help="ucdp.uu.se")
+    p09=st.slider("GPR Index",50.0,500.0,130.0,5.0,help="matteoiacoviello.com")
+    p10=st.slider("Riesgo expropiación (0–10)",0.0,10.0,3.0,0.5)
+    st.markdown("---")
+
+    st.markdown('<p class="sb-s">Dimensión Económica</p>', unsafe_allow_html=True)
+    e05=st.selectbox("Rating soberano",["AAA","AA+","AA","AA-","A+","A","A-","BBB+","BBB","BBB-","BB+","BB","BB-","B+","B","B-","CCC","D"],index=5)
+    e06=st.slider("CDS spread (puntos base)",0.0,2000.0,120.0,5.0,help="worldgovernmentbonds.com")
+    e01=st.number_input("Inflación (%)",value=5.0,step=0.1,help="imf.org WEO")
+    e02=st.number_input("Crecimiento PIB (%)",value=2.5,step=0.1)
+    e03=st.number_input("Deuda / PIB (%)",value=50.0,step=0.5)
+    e08=st.number_input("Cuenta corriente / PIB (%)",value=-2.0,step=0.5)
+    st.markdown("---")
+
+    st.markdown('<p class="sb-s">Ambiente de Negocios</p>', unsafe_allow_html=True)
+    b07=st.slider("TRACE Bribery (0–100)",0.0,100.0,45.0,1.0,help="traceinternational.org")
+    b08=st.slider("Cobertura TBIs (0–10)",0.0,10.0,5.0,0.5,help="unctad.org")
+    st.markdown("---")
+
+    st.markdown('<p class="sb-s">Dimensión Social</p>', unsafe_allow_html=True)
+    s01=st.slider("CPI (0–100)",0.0,100.0,50.0,1.0,help="transparency.org")
+    s03=st.slider("GPI (1–5)",1.0,5.0,2.0,0.01,help="visionofhumanity.org")
+    s04=st.slider("RSF Prensa (0–100)",0.0,100.0,40.0,1.0,help="rsf.org")
+    s05=st.slider("ND-GAIN (0–100)",0.0,100.0,50.0,0.5,help="gain.nd.edu")
+    s06=st.slider("Yale EPI (0–100)",0.0,100.0,45.0,0.5,help="epi.yale.edu")
+    s07=st.slider("Riesgo ESG (0–10)",0.0,10.0,5.0,0.5)
+    s08=st.slider("Presión comunitaria (0–10)",0.0,10.0,5.0,0.5)
+    st.markdown("---")
+
+    st.markdown('<p class="sb-s">Oportunidad Estratégica</p>', unsafe_allow_html=True)
+    o02=st.number_input("Crecimiento sector (%)",value=4.0,step=0.5)
+    o03=st.number_input("Tamaño mercado (USD M)",value=20000.0,step=1000.0)
+    o04=st.slider("Incentivos IED (0–10)",0.0,10.0,5.0,0.5)
+    o05=st.slider("Afinidad cultural (0–10)",0.0,10.0,5.0,0.5)
+    o06=st.slider("Multilateral (0–10)",0.0,10.0,5.0,0.5)
+    st.markdown("---")
+
+    st.markdown('<p class="sb-s">Análisis Financiero (Opcional)</p>', unsafe_allow_html=True)
+    inv=st.number_input("Inversión total (USD)",value=10_000_000,step=500_000)
+    ret=st.number_input("Retorno esperado (USD/año)",value=1_500_000,step=100_000)
+    st.markdown("---")
+    run_btn=st.button("Ejecutar Análisis")
+
+# ── EJECUCIÓN ────────────────────────────────────────────────────
+if run_btn:
+    with st.spinner(f"Descargando datos para {country}..."):
+        try:
+            buf=io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                auto_data=fetch_automatic_data(country)
+            manual_data={
+                "POL_06":p06,"POL_07":p07,"POL_08":p08,"POL_09":p09,"POL_10":p10,
+                "ECO_01":e01,"ECO_02":e02,"ECO_03":e03,"ECO_05":e05,"ECO_06":e06,"ECO_08":e08,
+                "BIZ_07":b07,"BIZ_08":b08,
+                "SOC_01":s01,"SOC_03":s03,"SOC_04":s04,"SOC_05":s05,"SOC_06":s06,"SOC_07":s07,"SOC_08":s08,
+                "OPP_02":o02,"OPP_03":o03,"OPP_04":o04,"OPP_05":o05,"OPP_06":o06,
+            }
+            irp=engine.compute(country,sector,a_year,auto_data,manual_data)
+            efa=None
+            if inv>0:
+                eco07=auto_data.get("ECO_07")
+                fxv=eco07.get("value") if isinstance(eco07,dict) else eco07
+                efa=calculate_efa(investment_usd=inv,irp_score=irp.irp_score or 50,fx_volatility=fxv,fx_data=auto_data)
+                if ret>0: efa=calculate_rar(efa,ret)
+            rec=generate(irp,asset_type,efa)
+            st.session_state.analyses[f"{country}_{sector}"]=(irp,efa,rec)
+            st.success(f"✓ Análisis de {country} completado — IRP: {irp.irp_score:.1f}")
+        except Exception as e:
+            st.error(f"Error: {e}")
+            import traceback; st.code(traceback.format_exc())
+
+# ── HEADER ───────────────────────────────────────────────────────
+n=len(st.session_state.analyses)
+st.markdown(f'<div class="app-hdr"><p class="app-brand">PolitRisk <span>Pro</span></p><p class="app-meta">Political Risk & Market Entry Intelligence &nbsp;|&nbsp; {n} análisis en cartera &nbsp;|&nbsp; {datetime.now().strftime("%d %b %Y")}</p></div>', unsafe_allow_html=True)
+st.markdown("<div style='height:.6rem'></div>", unsafe_allow_html=True)
+
+# ── MAPA MUNDIAL ─────────────────────────────────────────────────
+analyzed_rows, available_rows = [], []
+analyzed_names = set()
+
+for key,(a_irp,_,_) in st.session_state.analyses.items():
+    iso3 = ALL_COUNTRIES.get(a_irp.country,{}).get("iso3")
+    if iso3:
+        analyzed_rows.append({
+            "iso3":iso3,"country":a_irp.country,"irp":a_irp.irp_score or 0,
+            "text":f"<b>{a_irp.country}</b><br>IRP: {a_irp.irp_score:.1f} — {rl(a_irp.risk_level)}<br>{SECTORS.get(a_irp.sector,'')}<br><i>Haz clic para ver el análisis</i>",
+        })
+        analyzed_names.add(a_irp.country)
+
+for cname,cdata in ALL_COUNTRIES.items():
+    if cname not in analyzed_names:
+        iso3=cdata.get("iso3")
+        if iso3:
+            available_rows.append({
+                "iso3":iso3,"country":cname,
+                "text":f"<b>{cname}</b><br>Sin análisis<br><i>Selecciona en el panel izquierdo para analizar</i>",
+            })
+
+fig_map=go.Figure()
+
+if available_rows:
+    df_av=pd.DataFrame(available_rows)
+    fig_map.add_trace(go.Choropleth(
+        locations=df_av["iso3"], z=[0.5]*len(df_av),
+        colorscale=[[0,"#1B2F4E"],[1,"#1B2F4E"]],
+        showscale=False, marker_line_color="#2A4060", marker_line_width=0.5,
+        hovertext=df_av["text"], hoverinfo="text", name="Sin análisis",
+        customdata=df_av["country"],
+    ))
+
+if analyzed_rows:
+    df_an=pd.DataFrame(analyzed_rows)
+    fig_map.add_trace(go.Choropleth(
+        locations=df_an["iso3"], z=df_an["irp"], zmin=0, zmax=100,
+        colorscale=[
+            [0.0,"#8C1F1F"],[0.4,"#8C1F1F"],
+            [0.4,"#B85C1A"],[0.55,"#B85C1A"],
+            [0.55,"#B8891A"],[0.70,"#B8891A"],
+            [0.70,"#1A6B4A"],[1.0,"#1A6B4A"],
+        ],
+        showscale=True,
+        colorbar=dict(
+            title=dict(text="IRP",font=dict(size=10,family="DM Mono",color="#8395A7")),
+            tickfont=dict(size=9,family="DM Mono",color="#8395A7"),
+            thickness=10,len=0.5,x=1.01,bgcolor="rgba(0,0,0,0)",bordercolor="#2A4060"),
+        marker_line_color="#0F1E35", marker_line_width=1.5,
+        hovertext=df_an["text"], hoverinfo="text", name="Analizados",
+        customdata=df_an["country"],
+    ))
+
+fig_map.update_layout(
+    geo=dict(showframe=False,showcoastlines=True,coastlinecolor="#2A4060",
+             showland=True,landcolor="#1B2F4E",showocean=True,oceancolor="#0F1E35",
+             showcountries=True,countrycolor="#2A4060",bgcolor="#0F1E35",
+             projection_type="natural earth"),
+    paper_bgcolor="#0F1E35",plot_bgcolor="#0F1E35",
+    margin=dict(l=0,r=0,t=0,b=0),height=440,showlegend=False,
+    dragmode="pan",
+)
+
+# Capturar clic en el mapa
+event=st.plotly_chart(
+    fig_map, use_container_width=True,
+    config={"displayModeBar":True,"scrollZoom":True,
+            "modeBarButtonsToRemove":["select2d","lasso2d","autoScale2d"],
+            "displaylogo":False},
+    on_select="rerun",
+    key="world_map",
+)
+
+# Procesar clic
+if event and hasattr(event,"selection") and event.selection:
+    pts=event.selection.get("points",[])
+    if pts:
+        loc=pts[0].get("location") or pts[0].get("customdata")
+        if loc:
+            # Si es ISO3, convertir a nombre
+            if loc in ISO3_TO_NAME:
+                clicked=ISO3_TO_NAME[loc]
+            elif loc in ALL_COUNTRIES:
+                clicked=loc
+            else:
+                clicked=None
+            if clicked and clicked!=st.session_state.clicked_country:
+                st.session_state.clicked_country=clicked
+                st.rerun()
+
+# Leyenda + hint
+st.markdown("""
+<div class="map-legend">
+    <div class="li"><div class="ld" style="background:#1A6B4A"></div>Viable (≥70)</div>
+    <div class="li"><div class="ld" style="background:#B8891A"></div>Medio-bajo (55–69)</div>
+    <div class="li"><div class="ld" style="background:#B85C1A"></div>Medio-alto (40–54)</div>
+    <div class="li"><div class="ld" style="background:#8C1F1F"></div>No viable (&lt;40)</div>
+    <div class="li"><div class="ld" style="background:#1B2F4E;border:1px solid #2A4060"></div>Sin análisis</div>
+</div>
+<p class="click-hint">Haz clic en un país analizado para ver su resultado · Haz clic en cualquier país para seleccionarlo en el panel lateral</p>
+""", unsafe_allow_html=True)
+
+st.markdown("<div style='height:.6rem'></div>", unsafe_allow_html=True)
+
+# ── PANEL DE ANÁLISIS ─────────────────────────────────────────────
+if not st.session_state.analyses:
+    st.markdown("""
+    <div style="text-align:center;padding:2rem;background:#1B2F4E;border-radius:4px;border:1px solid #2A4060;">
+        <p style="font-family:'DM Serif Display',serif;font-size:1.3rem;color:white;margin-bottom:.4rem;">
+            Ningún país analizado aún
+        </p>
+        <p style="font-size:.80rem;color:#8395A7;margin:0;">
+            Configura el análisis en el panel izquierdo y haz clic en <strong style="color:#B8891A">Ejecutar Análisis</strong>.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+else:
+    DK=["political","economic","business","social","opportunity"]
+    DL=["Político","Económico","Negocios","Social","Oportunidad"]
+
+    # Selector
+    keys=list(st.session_state.analyses.keys())
+    labels=[f"{st.session_state.analyses[k][0].country} — {SECTORS.get(st.session_state.analyses[k][0].sector,'')}" for k in keys]
+
+    # Si se hizo clic en el mapa en un país analizado, seleccionarlo
+    default_sel=len(labels)-1
+    if st.session_state.clicked_country:
+        for i,k in enumerate(keys):
+            if st.session_state.analyses[k][0].country==st.session_state.clicked_country:
+                default_sel=i; break
+
+    if len(st.session_state.analyses)>1:
+        sel_lbl=st.selectbox("Ver análisis:",labels,index=default_sel,label_visibility="collapsed")
+        sel_key=keys[labels.index(sel_lbl)]
+    else:
+        sel_key=keys[0]
+
+    irp,efa,rec=st.session_state.analyses[sel_key]
+
+    # Banner país seleccionado
+    st.markdown(f"""
+    <div class="country-selected">
+        <div>
+            <div class="cs-name">{irp.country}</div>
+            <div class="cs-meta">{SECTORS.get(irp.sector,'')} &nbsp;|&nbsp; Año de referencia: {irp.analysis_year} &nbsp;|&nbsp; Cobertura: {irp.data_coverage_pct:.0f}%</div>
+        </div>
+        <span class="vbadge {rb(irp.risk_level)}">{rl(irp.risk_level)}</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # KPIs
+    c1,c2,c3,c4=st.columns(4)
+    irp_s=f"{irp.irp_score:.1f}" if irp.irp_score else "N/D"
+    with c1: st.markdown(f'<div class="kpi {kc(irp.risk_level)}"><div class="kpi-lbl">IRP — Índice de Riesgo Político</div><div class="kpi-val">{irp_s}</div><div class="kpi-sub">Escala 0–100</div></div>',unsafe_allow_html=True)
+    with c2:
+        ev=format_usd(efa.efa_usd) if efa else "—"
+        es=f"{efa.efa_pct:.1f}% de la inversión" if efa else "Sin datos financieros"
+        st.markdown(f'<div class="kpi"><div class="kpi-lbl">EFA — Exposición Financiera Ajustada</div><div class="kpi-val">{ev}</div><div class="kpi-sub">{es}</div></div>',unsafe_allow_html=True)
+    with c3:
+        rv=f"{efa.rar:.2f}x" if (efa and efa.rar) else "—"
+        st.markdown(f'<div class="kpi"><div class="kpi-lbl">RAR — Retorno Ajustado por Riesgo</div><div class="kpi-val">{rv}</div><div class="kpi-sub">Retorno / Exposición</div></div>',unsafe_allow_html=True)
+    with c4:
+        fx=f"{efa.fx_volatility*100:.1f}%" if (efa and efa.fx_volatility) else "—"
+        st.markdown(f'<div class="kpi"><div class="kpi-lbl">Volatilidad Cambiaria (12 meses)</div><div class="kpi-val">{fx}</div><div class="kpi-sub">Yahoo Finance — dato de hoy</div></div>',unsafe_allow_html=True)
+
+    st.markdown("<div style='height:.5rem'></div>",unsafe_allow_html=True)
+
+    # TABS
+    t1,t2,t3,t4=st.tabs(["Radar & Scores","Recomendación Estratégica","Indicadores Detallados","Comparador"])
+
+    with t1:
+        cr,cb=st.columns([1,1],gap="medium")
+        COLORS=["#2451A0","#B8891A","#1A6B4A","#8C1F1F","#5A3A9A"]
+        with cr:
+            traces=[]
+            for i,(k,(a,_,_)) in enumerate(st.session_state.analyses.items()):
+                vals=[a.dimensions[dk].dimension_score or 0 for dk in DK]
+                traces.append(go.Scatterpolar(r=vals+[vals[0]],theta=DL+[DL[0]],fill="toself",
+                    name=a.country,line=dict(color=COLORS[i%5],width=2),fillcolor=COLORS[i%5],opacity=0.15))
+            fig_r=go.Figure(data=traces)
+            fig_r.update_layout(polar=dict(bgcolor="#F3F5F8",
+                radialaxis=dict(visible=True,range=[0,100],tickfont=dict(size=9,family="DM Mono",color="#98A6B5"),gridcolor="#E4E9F0",linecolor="#E4E9F0"),
+                angularaxis=dict(tickfont=dict(size=10,family="DM Sans",color="#0F1E35"),gridcolor="#E4E9F0",linecolor="#E4E9F0")),
+                showlegend=len(st.session_state.analyses)>1,
+                legend=dict(font=dict(size=10,family="DM Sans"),bgcolor="rgba(255,255,255,0.8)"),
+                height=300,margin=dict(l=35,r=35,t=10,b=10),
+                paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)")
+            st.plotly_chart(fig_r,use_container_width=True,config={"displayModeBar":False})
+        with cb:
+            bl=[irp.dimensions[k].name for k in DK]
+            bs=[irp.dimensions[k].dimension_score or 0 for k in DK]
+            fig_b=go.Figure(go.Bar(x=bs,y=bl,orientation="h",marker_color=[sc(s) for s in bs],
+                text=[f"{s:.1f}" for s in bs],textposition="outside",textfont=dict(size=11,family="DM Mono",color="#0F1E35")))
+            fig_b.update_layout(xaxis=dict(range=[0,115],showgrid=True,gridcolor="#E4E9F0",tickfont=dict(size=9,family="DM Mono",color="#98A6B5"),zeroline=False),
+                yaxis=dict(tickfont=dict(size=10,family="DM Sans",color="#0F1E35"),autorange="reversed"),
+                height=280,margin=dict(l=10,r=50,t=10,b=10),paper_bgcolor="rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",bargap=0.45)
+            fig_b.add_vline(x=70,line_dash="dot",line_color="#1A6B4A",line_width=1,opacity=0.5,annotation_text="Viable",annotation_font=dict(size=9,color="#1A6B4A"))
+            st.plotly_chart(fig_b,use_container_width=True,config={"displayModeBar":False})
+
+    with t2:
+        col_rec,col_n=st.columns([2,1],gap="medium")
+        with col_rec:
+            st.markdown(f'<div style="margin-bottom:.9rem;"><span class="vbadge {rb(irp.risk_level)}">{rl(irp.risk_level)}</span></div>',unsafe_allow_html=True)
+            st.markdown(f'<p class="rec-text">{rec.executive_summary}</p>',unsafe_allow_html=True)
+            if efa and rec.efa_summary: st.markdown(f'<div class="efa-box">{rec.efa_summary}</div>',unsafe_allow_html=True)
+            for label,attr in [("Análisis Político e Institucional","political_analysis"),
+                                ("Análisis Económico y Financiero","economic_analysis"),
+                                ("Análisis del Ambiente de Negocios","business_analysis"),
+                                ("Análisis Social y Reputacional","social_analysis"),
+                                ("Análisis de Oportunidad Estratégica","opportunity_analysis")]:
+                with st.expander(label): st.markdown(f'<p class="rec-text">{getattr(rec,attr)}</p>',unsafe_allow_html=True)
+            grouped=conditions_by_category(rec)
+            for cat,name in [("contractual","Condiciones Contractuales"),("financial","Condiciones Financieras"),("operational","Condiciones Operacionales")]:
+                conds=grouped.get(cat,[])
+                if conds:
+                    st.markdown(f'<div class="cond-cat">{name}</div>',unsafe_allow_html=True)
+                    for c in conds:
+                        cls="ob" if c.priority=="obligatoria" else "re"
+                        pl="Obligatoria" if c.priority=="obligatoria" else "Recomendada"
+                        lc="ob-lbl" if c.priority=="obligatoria" else "re-lbl"
+                        st.markdown(f'<div class="ci {cls}"><div><span class="ci-prio {lc}">{pl}</span> <span class="ci-main">{c.text}</span></div><div class="ci-rat">{c.rationale}</div></div>',unsafe_allow_html=True)
+        with col_n:
+            st.markdown('<p style="font-size:.60rem;text-transform:uppercase;letter-spacing:.12em;color:#98A6B5;font-weight:600;margin-bottom:.4rem;">Notas del Analista</p>',unsafe_allow_html=True)
+            kn=f"{irp.country}_{irp.sector}"
+            notes=st.text_area("Notas",value=st.session_state.analyst_notes.get(kn,""),height=220,placeholder="Contexto cualitativo, ajustes, supuestos...",label_visibility="collapsed")
+            st.session_state.analyst_notes[kn]=notes
+            st.markdown(f'<div style="margin-top:.8rem;padding:.7rem;background:#F3F5F8;border-radius:2px;font-size:.68rem;color:#98A6B5;line-height:1.55;"><strong style="color:#0F1E35;display:block;margin-bottom:.2rem;">Plazo de revisión</strong>{rec.review_schedule}</div>',unsafe_allow_html=True)
+
+    with t3:
+        dtabs=st.tabs([irp.dimensions[k].name for k in DK])
+        for dt,dk in zip(dtabs,DK):
+            with dt:
+                dim=irp.dimensions[dk]
+                rows=""
+                for code,ind in dim.indicators.items():
+                    yr=f'<span class="ind-ya">{ind.data_year}</span>' if (ind.input_type=="api" and ind.data_year) else '<span class="ind-ym">Manual</span>'
+                    if ind.score is not None:
+                        shtml=f'<span class="ind-sc" style="color:{sc(ind.score)}">{ind.score:.1f}</span>'
+                        bhtml=f'<div class="ind-bb"><div class="ind-bf" style="width:{int(ind.score)}%;background:{sc(ind.score)}"></div></div>'
+                    else: shtml='<span class="ind-na">N/D</span>';bhtml='<div class="ind-bb"></div>'
+                    rows+=f'<div class="ind-row"><span class="ind-code">{code}</span><span class="ind-name">{ind.name}</span>{yr}{shtml}{bhtml}</div>'
+                ds=f"{dim.dimension_score:.1f}" if dim.dimension_score else "N/D"
+                st.markdown(f'<div style="display:flex;justify-content:space-between;margin-bottom:.6rem;padding-bottom:.4rem;border-bottom:1px solid #E4E9F0;"><span style="font-size:.66rem;color:#98A6B5;">Cobertura: <strong style="color:{sc(dim.coverage_pct)}">{dim.coverage_pct:.0f}%</strong></span><span style="font-size:.66rem;color:#98A6B5;">Score: <strong style="color:{sc(dim.dimension_score)};font-family:\'DM Mono\'">{ds}</strong></span></div>{rows}',unsafe_allow_html=True)
+
+    with t4:
+        if len(st.session_state.analyses)<2:
+            st.markdown('<p style="font-size:.80rem;color:#98A6B5;text-align:center;padding:2rem;">Ejecuta análisis de al menos 2 países para activar el comparador.</p>',unsafe_allow_html=True)
+        else:
+            comp=[]
+            for k2,(ai,ae,_) in st.session_state.analyses.items():
+                row={"País":ai.country,"Sector":SECTORS.get(ai.sector,""),"IRP":f"{ai.irp_score:.1f}" if ai.irp_score else "N/D","Viabilidad":rl(ai.risk_level)}
+                for dk in DK:
+                    d=ai.dimensions.get(dk)
+                    row[ai.dimensions[dk].name.split(" ")[0]]=f"{d.dimension_score:.1f}" if d and d.dimension_score else "N/D"
+                if ae: row["EFA"]=format_usd(ae.efa_usd); row["RAR"]=f"{ae.rar:.2f}x" if ae.rar else "—"
+                comp.append(row)
+            st.dataframe(pd.DataFrame(comp).set_index("País"),use_container_width=True)
+        if st.button("Limpiar todos los análisis"):
+            st.session_state.analyses={}; st.session_state.clicked_country=None; st.rerun()
+
+st.markdown(f'<div style="text-align:center;padding:1rem 0 .3rem;font-size:.58rem;color:#2A4060;letter-spacing:.09em;text-transform:uppercase;">PolitRisk Pro &nbsp;·&nbsp; Political Risk & Market Entry Intelligence &nbsp;·&nbsp; {datetime.now().strftime("%B %Y")}</div>',unsafe_allow_html=True)
+
+==> ./main.py <==
+# main.py
+# Punto de entrada de PolitRisk Pro v2.
+# El sistema siempre usa el dato más reciente de cada fuente.
+# Ejecutar con: python3 main.py
+# ─────────────────────────────────────────────────────────────────
+
+from connectors.orchestrator import fetch_automatic_data
+from engine.scoring          import ScoringEngine
+from engine.financial        import calculate_efa, calculate_rar, format_usd
+from engine.recommendations  import generate, conditions_by_category
+from config                  import SECTORS
+
+engine = ScoringEngine()
+
+
+def run_analysis(
+    country:    str,
+    sector:     str,
+    analysis_year: int,          # año de referencia del informe
+
+    # ── DATOS MANUALES ────────────────────────────────────────────
+    pol_06_vdem:         float,  # V-Dem EDI 0-1
+    pol_07_freedom:      float,  # Freedom House 0-100
+    pol_08_ucdp:         float,  # Conflicto UCDP 0-10
+    pol_09_gpr:          float,  # GPR Index
+    pol_10_expropiacion: float,  # Riesgo expropiación 0-10
+    eco_05_rating:       str,    # Rating S&P
+    eco_06_cds:          float,  # CDS spread puntos base
+    eco_01_inflacion:    float,  # FMI inflación %
+    eco_02_pib:          float,  # FMI crecimiento PIB %
+    eco_03_deuda:        float,  # FMI deuda/PIB %
+    eco_08_cuenta_cte:   float,  # FMI cuenta corriente/PIB %
+    biz_07_trace:        float,  # TRACE Bribery 0-100
+    biz_08_tbis:         float,  # TBIs 0-10
+    soc_01_cpi:          float,  # CPI TI 0-100
+    soc_03_gpi:          float,  # GPI 1-5
+    soc_04_rsf:          float,  # RSF 0-100
+    soc_05_ndgain:       float,  # ND-GAIN 0-100
+    soc_06_epi:          float,  # Yale EPI 0-100
+    soc_07_esg:          float,  # ESG 0-10
+    soc_08_comunidad:    float,  # Presión comunitaria 0-10
+    opp_02_crecimiento:  float,  # Crecimiento sector %
+    opp_03_mercado:      float,  # Tamaño mercado USD M
+    opp_04_ied:          float,  # Incentivos IED 0-10
+    opp_05_afinidad:     float,  # Afinidad cultural 0-10
+    opp_06_multilateral: float,  # Multilateral 0-10
+    asset_type:          str   = "semi_fixed",
+    investment_usd:      float = 0,
+    expected_return_usd: float = 0,
+):
+    print(f"\n{'═'*58}")
+    print(f"  POLITRISK PRO v2.0")
+    print(f"  {country} | {SECTORS.get(sector, sector)} | {analysis_year}")
+    print(f"{'═'*58}")
+
+    # 1. Datos automáticos — siempre el más reciente de cada fuente
+    auto_data = fetch_automatic_data(country)
+
+    # 2. Datos manuales
+    manual_data = {
+        "POL_06": pol_06_vdem,
+        "POL_07": pol_07_freedom,
+        "POL_08": pol_08_ucdp,
+        "POL_09": pol_09_gpr,
+        "POL_10": pol_10_expropiacion,
+        "ECO_01": eco_01_inflacion,
+        "ECO_02": eco_02_pib,
+        "ECO_03": eco_03_deuda,
+        "ECO_05": eco_05_rating,
+        "ECO_06": eco_06_cds,
+        "ECO_08": eco_08_cuenta_cte,
+        "BIZ_07": biz_07_trace,
+        "BIZ_08": biz_08_tbis,
+        "SOC_01": soc_01_cpi,
+        "SOC_03": soc_03_gpi,
+        "SOC_04": soc_04_rsf,
+        "SOC_05": soc_05_ndgain,
+        "SOC_06": soc_06_epi,
+        "SOC_07": soc_07_esg,
+        "SOC_08": soc_08_comunidad,
+        "OPP_02": opp_02_crecimiento,
+        "OPP_03": opp_03_mercado,
+        "OPP_04": opp_04_ied,
+        "OPP_05": opp_05_afinidad,
+        "OPP_06": opp_06_multilateral,
+    }
+
+    # 3. Scoring
+    irp = engine.compute(
+        country       = country,
+        sector        = sector,
+        analysis_year = analysis_year,
+        auto_data     = auto_data,
+        manual_data   = manual_data,
+    )
+
+    # 4. Exposición financiera
+    efa = None
+    if investment_usd > 0:
+        efa = calculate_efa(
+            investment_usd = investment_usd,
+            irp_score      = irp.irp_score or 50,
+            fx_volatility  = auto_data.get("ECO_07", {}).get("value"),
+            fx_data        = auto_data,
+        )
+        if expected_return_usd > 0:
+            efa = calculate_rar(efa, expected_return_usd)
+
+    # 5. Recomendación
+    rec = generate(irp, asset_type, efa)
+
+    # 6. Reporte en consola
+    _print_report(irp, efa, rec)
+
+    return irp, efa, rec
+
+
+def _print_report(irp, efa, rec):
+    LABELS = {
+        "viable":            "VIABLE",
+        "conditioned":       "CONDICIONADO",
+        "not_viable":        "NO VIABLE",
+        "insufficient_data": "DATOS INSUFICIENTES",
+    }
+    SYMBOLS = {
+        "viable": "✅", "conditioned": "⚠️ ",
+        "not_viable": "🔴", "insufficient_data": "❓",
+    }
+
+    print(f"\n{'─'*58}")
+    print(f"  RESULTADO")
+    print(f"{'─'*58}")
+    print(f"  País:      {irp.country}")
+    print(f"  Sector:    {SECTORS.get(irp.sector, irp.sector)}")
+    print(f"  Año ref.:  {irp.analysis_year}")
+    print(f"  Cobertura: {irp.data_coverage_pct:.0f}%")
+    print(f"  Calculado: {irp.computed_at}")
+
+    if irp.data_years:
+        print(f"\n  Años de datos automáticos utilizados:")
+        for code, year in sorted(irp.data_years.items()):
+            print(f"    {code:<8} → {year}")
+
+    print(f"\n  {'DIMENSIÓN':<28} {'SCORE':>6}  {'COB.':>5}")
+    print(f"  {'─'*45}")
+    for dim in irp.dimensions.values():
+        score_str = f"{dim.dimension_score:.1f}" if dim.dimension_score else "N/D"
+        bar       = "█" * int((dim.dimension_score or 0) / 5) + "░" * (20 - int((dim.dimension_score or 0) / 5))
+        print(f"  {dim.name:<28} {score_str:>6}  {dim.coverage_pct:.0f}%   {bar}")
+
+    print(f"\n  {'─'*45}")
+    irp_str = f"{irp.irp_score:.1f}" if irp.irp_score else "N/D"
+    symbol  = SYMBOLS.get(irp.risk_level, "")
+    label   = LABELS.get(irp.risk_level, irp.risk_level)
+    print(f"  IRP TOTAL: {irp_str}   {symbol} {label}")
+
+    if efa:
+        print(f"\n{'─'*58}")
+        print(f"  EXPOSICIÓN FINANCIERA AJUSTADA")
+        print(f"{'─'*58}")
+        print(f"  Inversión:    {format_usd(efa.investment_usd)}")
+        print(f"  Volatilidad:  {efa.fx_volatility*100:.1f}% cambiaria 12m (Yahoo Finance — hoy)")
+        print(f"  EFA:          {format_usd(efa.efa_usd)} ({efa.efa_pct:.1f}%)")
+        if efa.rar:
+            print(f"  RAR:          {efa.rar:.2f} — {efa.rar_interpretation}")
+
+    print(f"\n{'─'*58}")
+    print(f"  {rec.viability_summary}")
+
+    grouped = conditions_by_category(rec)
+    for cat, name in [("contractual","CONTRACTUALES"),("financial","FINANCIERAS"),("operational","OPERACIONALES")]:
+        conds = grouped.get(cat, [])
+        if conds:
+            print(f"\n  {name}:")
+            for c in conds:
+                mark = "⚠️ " if c.priority == "obligatoria" else "→ "
+                print(f"    {mark}{c.text}")
+
+    print(f"\n  REVISIÓN: {rec.review_schedule}")
+    print(f"\n{'═'*58}\n")
+
+
+# ─────────────────────────────────────────────────────────────────
+#  ANÁLISIS DE EJEMPLO
+# ─────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    run_analysis(
+        country       = "Chile",
+        sector        = "mining",
+        analysis_year = 2026,       # año del informe — los datos se toman del más reciente disponible
+
+        pol_06_vdem         = 0.79,
+        pol_07_freedom      = 93.0,
+        pol_08_ucdp         = 1.0,
+        pol_09_gpr          = 120.0,
+        pol_10_expropiacion = 3.0,
+        eco_05_rating       = "A",
+        eco_06_cds          = 85.0,
+        eco_01_inflacion    = 4.5,
+        eco_02_pib          = 2.5,
+        eco_03_deuda        = 38.0,
+        eco_08_cuenta_cte   = -3.5,
+        biz_07_trace        = 32.0,
+        biz_08_tbis         = 7.0,
+        soc_01_cpi          = 66.0,
+        soc_03_gpi          = 1.78,
+        soc_04_rsf          = 31.0,
+        soc_05_ndgain       = 56.3,
+        soc_06_epi          = 51.1,
+        soc_07_esg          = 5.0,
+        soc_08_comunidad    = 6.0,
+        opp_02_crecimiento  = 4.5,
+        opp_03_mercado      = 45000,
+        opp_04_ied          = 6.5,
+        opp_05_afinidad     = 8.5,
+        opp_06_multilateral = 7.0,
+        asset_type          = "fixed",
+        investment_usd      = 10_000_000,
+        expected_return_usd = 1_800_000,
+    )
+
+==> ./data/countries.py <==
+# data/countries.py — redirige al catálogo completo
+from data.all_countries import ALL_COUNTRIES as COUNTRIES, get_country, ISO3_TO_NAME, ISO2_TO_NAME
+
+==> ./data/__init__.py <==
+
+==> ./data/indicators.py <==
+# data/indicators.py
+# Catálogo de los 40 indicadores de PolitRisk Pro v2
+# Cada indicador especifica su fuente, frecuencia de actualización,
+# método de normalización y dimensión a la que pertenece.
+# ─────────────────────────────────────────────────────────────────
+
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class Indicator:
+    code:          str            # ej: "POL_01"
+    name:          str            # nombre legible
+    dimension:     str            # political | economic | business | social | opportunity
+    source:        str            # nombre de la fuente
+    source_url:    str            # URL de referencia
+    input_type:    str            # "api" | "manual"
+    update_freq:   str            # diaria | semanal | mensual | semestral | anual
+    api_key:       Optional[str]  # clave del indicador en la API (si aplica)
+    normalizer:    str            # nombre de la función de normalización
+    direction:     str            # "positive" (más=mejor) | "negative" (más=peor)
+    min_val:       float          # valor mínimo para normalización
+    max_val:       float          # valor máximo para normalización
+    description:   str            # qué mide y cómo interpretarlo
+    sector_notes:  str = ""       # notas específicas por sector
+
+
+INDICATORS = [
+
+    # ══════════════════════════════════════════════════════════════
+    # DIMENSIÓN 1 — POLÍTICO E INSTITUCIONAL (10 indicadores)
+    # ══════════════════════════════════════════════════════════════
+
+    Indicator(
+        code        = "POL_01",
+        name        = "Control de Corrupción",
+        dimension   = "political",
+        source      = "World Bank — Worldwide Governance Indicators",
+        source_url  = "https://info.worldbank.org/governance/wgi/",
+        input_type  = "api",
+        update_freq = "anual (rezago 18 meses)",
+        api_key     = "CC.EST",
+        normalizer  = "normalize_wgi",
+        direction   = "positive",
+        min_val     = -2.5,
+        max_val     = 2.5,
+        description = (
+            "Mide la percepción de hasta qué punto el poder público "
+            "se ejerce para beneficio privado, incluyendo corrupción "
+            "menor y a gran escala, y la captura del Estado por élites. "
+            "Fuente: agregado de 30+ encuestas y evaluaciones de expertos."
+        ),
+    ),
+    Indicator(
+        code        = "POL_02",
+        name        = "Estado de Derecho",
+        dimension   = "political",
+        source      = "World Bank — Worldwide Governance Indicators",
+        source_url  = "https://info.worldbank.org/governance/wgi/",
+        input_type  = "api",
+        update_freq = "anual (rezago 18 meses)",
+        api_key     = "RL.EST",
+        normalizer  = "normalize_wgi",
+        direction   = "positive",
+        min_val     = -2.5,
+        max_val     = 2.5,
+        description = (
+            "Refleja la confianza en las reglas de la sociedad: "
+            "calidad del cumplimiento de contratos, derechos de "
+            "propiedad, policía y tribunales, y riesgo de crimen "
+            "y violencia."
+        ),
+    ),
+    Indicator(
+        code        = "POL_03",
+        name        = "Estabilidad Política y Ausencia de Violencia",
+        dimension   = "political",
+        source      = "World Bank — Worldwide Governance Indicators",
+        source_url  = "https://info.worldbank.org/governance/wgi/",
+        input_type  = "api",
+        update_freq = "anual (rezago 18 meses)",
+        api_key     = "PV.EST",
+        normalizer  = "normalize_wgi",
+        direction   = "positive",
+        min_val     = -2.5,
+        max_val     = 2.5,
+        description = (
+            "Probabilidad de que el gobierno sea desestabilizado o "
+            "derrocado por medios inconstitucionales o violentos, "
+            "incluyendo terrorismo."
+        ),
+        sector_notes = "Crítico para minería e infraestructura por exposición de activos fijos.",
+    ),
+    Indicator(
+        code        = "POL_04",
+        name        = "Efectividad Gubernamental",
+        dimension   = "political",
+        source      = "World Bank — Worldwide Governance Indicators",
+        source_url  = "https://info.worldbank.org/governance/wgi/",
+        input_type  = "api",
+        update_freq = "anual (rezago 18 meses)",
+        api_key     = "GE.EST",
+        normalizer  = "normalize_wgi",
+        direction   = "positive",
+        min_val     = -2.5,
+        max_val     = 2.5,
+        description = (
+            "Calidad de los servicios públicos, la burocracia, "
+            "la independencia del servicio civil respecto a presiones "
+            "políticas, y credibilidad del compromiso del gobierno "
+            "con sus políticas."
+        ),
+    ),
+    Indicator(
+        code        = "POL_05",
+        name        = "Calidad Regulatoria",
+        dimension   = "political",
+        source      = "World Bank — Worldwide Governance Indicators",
+        source_url  = "https://info.worldbank.org/governance/wgi/",
+        input_type  = "api",
+        update_freq = "anual (rezago 18 meses)",
+        api_key     = "RQ.EST",
+        normalizer  = "normalize_wgi",
+        direction   = "positive",
+        min_val     = -2.5,
+        max_val     = 2.5,
+        description = (
+            "Capacidad del gobierno para formular e implementar "
+            "políticas y regulaciones sólidas que permitan y promuevan "
+            "el desarrollo del sector privado."
+        ),
+    ),
+    Indicator(
+        code        = "POL_06",
+        name        = "Índice de Democracia Electoral (EDI)",
+        dimension   = "political",
+        source      = "V-Dem — Varieties of Democracy (U. de Gotemburgo)",
+        source_url  = "https://www.v-dem.net/",
+        input_type  = "manual",
+        update_freq = "anual (publicado en marzo)",
+        api_key     = None,
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 1.0,
+        description = (
+            "Mide hasta qué punto el ideal de democracia electoral "
+            "se alcanza en la práctica. Basado en evaluaciones de "
+            "más de 3,500 expertos país por país. Escala 0-1. "
+            "El indicador más riguroso académicamente para democracia."
+        ),
+    ),
+    Indicator(
+        code        = "POL_07",
+        name        = "Libertades Civiles y Derechos Políticos",
+        dimension   = "political",
+        source      = "Freedom House — Freedom in the World",
+        source_url  = "https://freedomhouse.org/report/freedom-world",
+        input_type  = "manual",
+        update_freq = "anual (publicado en febrero)",
+        api_key     = None,
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 100.0,
+        description = (
+            "Score agregado de derechos políticos (40 pts) y "
+            "libertades civiles (60 pts). 100=máxima libertad. "
+            "Usado por inversores institucionales como proxy de "
+            "riesgo político estructural."
+        ),
+    ),
+    Indicator(
+        code        = "POL_08",
+        name        = "Conflicto Armado Organizado (UCDP)",
+        dimension   = "political",
+        source      = "Uppsala Conflict Data Program — U. de Uppsala",
+        source_url  = "https://ucdp.uu.se/",
+        input_type  = "manual",
+        update_freq = "anual",
+        api_key     = None,
+        normalizer  = "normalize_manual_risk",
+        direction   = "negative",
+        min_val     = 0.0,
+        max_val     = 10.0,
+        description = (
+            "Evaluación del nivel de conflicto armado organizado "
+            "en el país según el estándar UCDP (>25 muertes en "
+            "combate por año). Escala 0-10 asignada por el analista "
+            "con base en los datos UCDP. 0=sin conflicto, 10=guerra activa."
+        ),
+    ),
+    Indicator(
+        code        = "POL_09",
+        name        = "Índice de Riesgo Geopolítico (GPR)",
+        dimension   = "political",
+        source      = "Caldara & Iacoviello — Federal Reserve / Fed Dallas",
+        source_url  = "https://www.matteoiacoviello.com/gpr.htm",
+        input_type  = "manual",
+        update_freq = "mensual",
+        api_key     = None,
+        normalizer  = "normalize_range",
+        direction   = "negative",
+        min_val     = 0.0,
+        max_val     = 500.0,
+        description = (
+            "Mide la tensión geopolítica global mediante análisis "
+            "automatizado de texto en medios internacionales. "
+            "Publicado mensualmente por economistas de la Fed. "
+            "Base 100 = promedio histórico. Valor actual disponible "
+            "en matteoiacoviello.com/gpr.htm"
+        ),
+    ),
+    Indicator(
+        code        = "POL_10",
+        name        = "Riesgo de Expropiación y Renegociación Unilateral",
+        dimension   = "political",
+        source      = "Evaluación del analista",
+        source_url  = "",
+        input_type  = "manual",
+        update_freq = "por encargo",
+        api_key     = None,
+        normalizer  = "normalize_manual_risk",
+        direction   = "negative",
+        min_val     = 0.0,
+        max_val     = 10.0,
+        description = (
+            "Evaluación del analista sobre el riesgo de que el "
+            "gobierno expropie activos, renegocie contratos de "
+            "forma unilateral o cambie el marco legal del sector. "
+            "Considera: historial del país, discurso del gobierno "
+            "actual, TBIs vigentes y marco constitucional. "
+            "Escala 0-10 (0=sin riesgo, 10=riesgo máximo)."
+        ),
+        sector_notes = "El indicador más importante para minería e infraestructura.",
+    ),
+
+    # ══════════════════════════════════════════════════════════════
+    # DIMENSIÓN 2 — ECONÓMICO Y FINANCIERO (8 indicadores)
+    # ══════════════════════════════════════════════════════════════
+
+    Indicator(
+        code        = "ECO_01",
+        name        = "Inflación Proyectada",
+        dimension   = "economic",
+        source      = "FMI — World Economic Outlook",
+        source_url  = "https://www.imf.org/en/Publications/WEO",
+        input_type  = "api",
+        update_freq = "semestral (abril y octubre)",
+        api_key     = "PCPIPCH",
+        normalizer  = "normalize_inflation",
+        direction   = "negative",
+        min_val     = 0.0,
+        max_val     = 50.0,
+        description = (
+            "Tasa de inflación al consumidor proyectada por el FMI "
+            "para el año en curso. Usa proyecciones WEO, que son "
+            "más recientes que los datos históricos del BM."
+        ),
+    ),
+    Indicator(
+        code        = "ECO_02",
+        name        = "Crecimiento del PIB Real Proyectado",
+        dimension   = "economic",
+        source      = "FMI — World Economic Outlook",
+        source_url  = "https://www.imf.org/en/Publications/WEO",
+        input_type  = "api",
+        update_freq = "semestral (abril y octubre)",
+        api_key     = "NGDP_RPCH",
+        normalizer  = "normalize_gdp_growth",
+        direction   = "positive",
+        min_val     = -5.0,
+        max_val     = 10.0,
+        description = "Crecimiento del PIB real proyectado por el FMI. Rango esperado -5% a +10%.",
+    ),
+    Indicator(
+        code        = "ECO_03",
+        name        = "Deuda Pública Bruta / PIB",
+        dimension   = "economic",
+        source      = "FMI — World Economic Outlook",
+        source_url  = "https://www.imf.org/en/Publications/WEO",
+        input_type  = "api",
+        update_freq = "semestral",
+        api_key     = "GGXWDG_NGDP",
+        normalizer  = "normalize_debt_gdp",
+        direction   = "negative",
+        min_val     = 0.0,
+        max_val     = 200.0,
+        description = "Deuda pública bruta consolidada como % del PIB. Menos=mejor.",
+    ),
+    Indicator(
+        code        = "ECO_04",
+        name        = "Reservas Internacionales (meses de importación)",
+        dimension   = "economic",
+        source      = "World Bank",
+        source_url  = "https://data.worldbank.org",
+        input_type  = "api",
+        update_freq = "anual",
+        api_key     = "FI.RES.TOTL.MO",
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 24.0,
+        description = "Meses de importaciones que cubren las reservas internacionales brutas.",
+    ),
+    Indicator(
+        code        = "ECO_05",
+        name        = "Calificación Soberana (S&P)",
+        dimension   = "economic",
+        source      = "S&P Global Ratings / Fitch / Moody's",
+        source_url  = "https://www.spglobal.com/ratings",
+        input_type  = "manual",
+        update_freq = "continuo (monitorear cambios)",
+        api_key     = None,
+        normalizer  = "normalize_sovereign_rating",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 22.0,
+        description = (
+            "Rating soberano en escala S&P: AAA(22), AA+(21)... "
+            "BB(11)... B(8)... D(1). Buscar en spglobal.com o "
+            "fitchratings.com. Usar la escala S&P como referencia."
+        ),
+    ),
+    Indicator(
+        code        = "ECO_06",
+        name        = "CDS Spread Soberano (puntos base)",
+        dimension   = "economic",
+        source      = "World Government Bonds",
+        source_url  = "http://www.worldgovernmentbonds.com/",
+        input_type  = "manual",
+        update_freq = "diaria",
+        api_key     = None,
+        normalizer  = "normalize_range",
+        direction   = "negative",
+        min_val     = 0.0,
+        max_val     = 2000.0,
+        description = (
+            "Credit Default Swap spread a 5 años en puntos base. "
+            "Mide lo que el mercado cobra HOY para asegurar deuda "
+            "soberana. Es el indicador de riesgo país más actualizado "
+            "disponible. 0pb=riesgo mínimo, 2000pb=riesgo máximo. "
+            "Buscar en worldgovernmentbonds.com (gratuito)."
+        ),
+    ),
+    Indicator(
+        code        = "ECO_07",
+        name        = "Volatilidad Cambiaria (12 meses)",
+        dimension   = "economic",
+        source      = "Yahoo Finance API",
+        source_url  = "https://finance.yahoo.com/",
+        input_type  = "api",
+        update_freq = "diaria",
+        api_key     = None,
+        normalizer  = "normalize_range",
+        direction   = "negative",
+        min_val     = 0.0,
+        max_val     = 1.0,
+        description = (
+            "Volatilidad del tipo de cambio respecto al USD en los "
+            "últimos 12 meses: (Max-Min)/Promedio. "
+            "0=moneda estable, 1=fluctuación total. "
+            "Clave para calcular la Exposición Financiera Ajustada (EFA)."
+        ),
+    ),
+    Indicator(
+        code        = "ECO_08",
+        name        = "Balanza de Cuenta Corriente / PIB",
+        dimension   = "economic",
+        source      = "FMI — World Economic Outlook",
+        source_url  = "https://www.imf.org/en/Publications/WEO",
+        input_type  = "api",
+        update_freq = "semestral",
+        api_key     = "BCA_NGDPD",
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = -15.0,
+        max_val     = 15.0,
+        description = (
+            "Saldo de la balanza por cuenta corriente como % del PIB. "
+            "Déficits persistentes indican dependencia de capital "
+            "extranjero y vulnerabilidad ante salidas de capital."
+        ),
+    ),
+
+    # ══════════════════════════════════════════════════════════════
+    # DIMENSIÓN 3 — AMBIENTE DE NEGOCIOS (8 indicadores)
+    # ══════════════════════════════════════════════════════════════
+
+    Indicator(
+        code        = "BIZ_01",
+        name        = "Entorno Regulatorio para Negocios (B-READY)",
+        dimension   = "business",
+        source      = "World Bank — Business Ready",
+        source_url  = "https://www.worldbank.org/en/programs/business-enabling-environment",
+        input_type  = "api",
+        update_freq = "anual",
+        api_key     = "IC.BUS.EASE.XQ",
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 100.0,
+        description = (
+            "Sucesor del Doing Business (discontinuado en 2021 "
+            "por escándalos de manipulación). Evalúa el entorno "
+            "regulatorio para empresas privadas en 10 dimensiones. "
+            "Escala 0-100."
+        ),
+    ),
+    Indicator(
+        code        = "BIZ_02",
+        name        = "Protección de Inversores Minoritarios",
+        dimension   = "business",
+        source      = "World Bank",
+        source_url  = "https://data.worldbank.org",
+        input_type  = "api",
+        update_freq = "anual",
+        api_key     = "IC.PRT.INVS.XQ",
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 10.0,
+        description = "Grado de protección legal a inversores minoritarios en transacciones. Escala 0-10.",
+    ),
+    Indicator(
+        code        = "BIZ_03",
+        name        = "Tiempo para Constituir una Empresa (días)",
+        dimension   = "business",
+        source      = "World Bank",
+        source_url  = "https://data.worldbank.org",
+        input_type  = "api",
+        update_freq = "anual",
+        api_key     = "IC.REG.DURS",
+        normalizer  = "normalize_range",
+        direction   = "negative",
+        min_val     = 0.0,
+        max_val     = 200.0,
+        description = "Días hábiles para completar el registro legal de una empresa. Menos=mejor.",
+    ),
+    Indicator(
+        code        = "BIZ_04",
+        name        = "Índice de Capital Humano (HCI)",
+        dimension   = "business",
+        source      = "World Bank — Human Capital Project",
+        source_url  = "https://www.worldbank.org/en/publication/human-capital",
+        input_type  = "api",
+        update_freq = "anual",
+        api_key     = "HD.HCI.OVRL",
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 1.0,
+        description = (
+            "Productividad potencial de un niño nacido hoy dado "
+            "el nivel actual de educación y salud del país. "
+            "Escala 0-1. Proxy de disponibilidad de talento calificado."
+        ),
+        sector_notes = "Especialmente relevante para tech y energía renovable.",
+    ),
+    Indicator(
+        code        = "BIZ_05",
+        name        = "Desempeño Logístico (LPI)",
+        dimension   = "business",
+        source      = "World Bank — Logistics Performance Index",
+        source_url  = "https://lpi.worldbank.org/",
+        input_type  = "api",
+        update_freq = "bienal",
+        api_key     = "LP.LPI.OVRL.XQ",
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = 1.0,
+        max_val     = 5.0,
+        description = "Calidad de infraestructura logística, aduanas y cadena de suministro. Escala 1-5.",
+        sector_notes = "Crítico para minería (exportación de commodities) e infraestructura.",
+    ),
+    Indicator(
+        code        = "BIZ_06",
+        name        = "Penetración de Internet",
+        dimension   = "business",
+        source      = "World Bank",
+        source_url  = "https://data.worldbank.org",
+        input_type  = "api",
+        update_freq = "anual",
+        api_key     = "IT.NET.USER.ZS",
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 100.0,
+        description = "Porcentaje de la población que usa internet. Proxy de digitalización del mercado.",
+        sector_notes = "Indicador principal para tech. Complementario en otros sectores.",
+    ),
+    Indicator(
+        code        = "BIZ_07",
+        name        = "Riesgo de Soborno Empresarial (TRACE)",
+        dimension   = "business",
+        source      = "TRACE International — Bribery Risk Matrix",
+        source_url  = "https://www.traceinternational.org/trace-matrix",
+        input_type  = "manual",
+        update_freq = "anual",
+        api_key     = None,
+        normalizer  = "normalize_range",
+        direction   = "negative",
+        min_val     = 0.0,
+        max_val     = 100.0,
+        description = (
+            "Score TRACE de riesgo de soborno para empresas "
+            "operando en ese país. Evalúa oportunidades de soborno, "
+            "disuasión, transparencia y anticuerpos culturales. "
+            "0=sin riesgo, 100=riesgo máximo. Gratuito en traceinternational.org."
+        ),
+    ),
+    Indicator(
+        code        = "BIZ_08",
+        name        = "Cobertura de TBIs y Acuerdos de Inversión",
+        dimension   = "business",
+        source      = "Evaluación del analista (UNCTAD Investment Hub)",
+        source_url  = "https://investmentpolicy.unctad.org/",
+        input_type  = "manual",
+        update_freq = "por encargo",
+        api_key     = None,
+        normalizer  = "normalize_manual_opportunity",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 10.0,
+        description = (
+            "Evaluación de la cobertura de Tratados Bilaterales de "
+            "Inversión (TBI/BIT) entre el país destino y el país de "
+            "origen del cliente. Considera: existencia del TBI, "
+            "cláusulas de arbitraje, acuerdos de libre comercio "
+            "vigentes. Verificar en investmentpolicy.unctad.org. "
+            "Escala 0-10."
+        ),
+    ),
+
+    # ══════════════════════════════════════════════════════════════
+    # DIMENSIÓN 4 — SOCIAL Y REPUTACIONAL (8 indicadores)
+    # ══════════════════════════════════════════════════════════════
+
+    Indicator(
+        code        = "SOC_01",
+        name        = "Índice de Percepción de Corrupción (CPI)",
+        dimension   = "social",
+        source      = "Transparency International",
+        source_url  = "https://www.transparency.org/en/cpi",
+        input_type  = "manual",
+        update_freq = "anual (enero)",
+        api_key     = None,
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 100.0,
+        description = (
+            "Percepción de corrupción del sector público. "
+            "100=sector público percibido como muy limpio. "
+            "Basado en 13 fuentes de datos de 12 instituciones. "
+            "El indicador anticorrupción más citado del mundo."
+        ),
+    ),
+    Indicator(
+        code        = "SOC_02",
+        name        = "Conflictividad Social y Protestas (ACLED)",
+        dimension   = "social",
+        source      = "ACLED — Armed Conflict Location & Event Data",
+        source_url  = "https://acleddata.com/",
+        input_type  = "api",
+        update_freq = "semanal",
+        api_key     = None,
+        normalizer  = "normalize_social_conflicts",
+        direction   = "negative",
+        min_val     = 0.0,
+        max_val     = 500.0,
+        description = (
+            "Número de eventos de conflicto, protesta y disturbio "
+            "registrados en los últimos 12 meses según ACLED. "
+            "El dataset más riguroso y actualizado para conflictividad. "
+            "Requiere registro gratuito en acleddata.com para API key."
+        ),
+        sector_notes = "Especialmente relevante para minería (conflictos comunitarios).",
+    ),
+    Indicator(
+        code        = "SOC_03",
+        name        = "Índice de Paz Global (GPI)",
+        dimension   = "social",
+        source      = "Institute for Economics and Peace",
+        source_url  = "https://www.visionofhumanity.org/maps/",
+        input_type  = "manual",
+        update_freq = "anual (junio)",
+        api_key     = None,
+        normalizer  = "normalize_gpi",
+        direction   = "negative",
+        min_val     = 1.0,
+        max_val     = 5.0,
+        description = (
+            "Mide el nivel de paz en 23 indicadores cuantitativos "
+            "y cualitativos: conflictos internos y externos, "
+            "seguridad social, militarización. Escala 1-5 "
+            "(1=más pacífico). Publicado anualmente en junio."
+        ),
+    ),
+    Indicator(
+        code        = "SOC_04",
+        name        = "Libertad de Prensa (RSF)",
+        dimension   = "social",
+        source      = "Reporters Without Borders — Press Freedom Index",
+        source_url  = "https://rsf.org/en/index",
+        input_type  = "manual",
+        update_freq = "anual (mayo)",
+        api_key     = None,
+        normalizer  = "normalize_rsf",
+        direction   = "negative",
+        min_val     = 0.0,
+        max_val     = 100.0,
+        description = (
+            "Libertad de prensa en escala 0-100. "
+            "0=máxima libertad (mejor), 100=sin libertad (peor). "
+            "Proxy del espacio cívico y de la transparencia informativa "
+            "disponible para el inversor."
+        ),
+    ),
+    Indicator(
+        code        = "SOC_05",
+        name        = "Vulnerabilidad Climática (ND-GAIN)",
+        dimension   = "social",
+        source      = "Notre Dame Global Adaptation Initiative",
+        source_url  = "https://gain.nd.edu/our-work/country-index/",
+        input_type  = "manual",
+        update_freq = "anual",
+        api_key     = None,
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 100.0,
+        description = (
+            "Score ND-GAIN: combina vulnerabilidad al cambio climático "
+            "y capacidad de adaptación. Mayor score = menos vulnerable "
+            "y más preparado. Especialmente relevante para proyectos "
+            "de largo plazo (minería, infraestructura)."
+        ),
+        sector_notes = "Crítico para minería (riesgo hídrico) y energía renovable.",
+    ),
+    Indicator(
+        code        = "SOC_06",
+        name        = "Desempeño Ambiental (EPI)",
+        dimension   = "social",
+        source      = "Yale Environmental Performance Index",
+        source_url  = "https://epi.yale.edu/",
+        input_type  = "manual",
+        update_freq = "bienal",
+        api_key     = None,
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 100.0,
+        description = (
+            "Desempeño ambiental del país en 40 indicadores "
+            "organizados en 11 categorías. Score 0-100. "
+            "Publicado por Yale cada dos años. Proxy de la "
+            "exposición a regulación ambiental y litigios ESG."
+        ),
+    ),
+    Indicator(
+        code        = "SOC_07",
+        name        = "Riesgo ESG Sectorial",
+        dimension   = "social",
+        source      = "Evaluación del analista",
+        source_url  = "",
+        input_type  = "manual",
+        update_freq = "por encargo",
+        api_key     = None,
+        normalizer  = "normalize_manual_risk",
+        direction   = "negative",
+        min_val     = 0.0,
+        max_val     = 10.0,
+        description = (
+            "Evaluación del analista sobre el riesgo ESG específico "
+            "del sector en ese país. Considera: estándares laborales, "
+            "riesgo ambiental operacional, cumplimiento CSRD/ESRS "
+            "para Europa, Convenio 169 OIT para comunidades indígenas. "
+            "Escala 0-10."
+        ),
+    ),
+    Indicator(
+        code        = "SOC_08",
+        name        = "Presión Comunitaria y Licencia Social",
+        dimension   = "social",
+        source      = "Evaluación del analista",
+        source_url  = "",
+        input_type  = "manual",
+        update_freq = "por encargo",
+        api_key     = None,
+        normalizer  = "normalize_manual_risk",
+        direction   = "negative",
+        min_val     = 0.0,
+        max_val     = 10.0,
+        description = (
+            "Evaluación de la resistencia de comunidades locales "
+            "al proyecto: historial de conflictos con empresas del "
+            "sector, organizaciones de oposición activas, requerimientos "
+            "de consulta previa (Convenio 169 OIT). Escala 0-10."
+        ),
+        sector_notes = "El indicador más crítico para minería extractiva.",
+    ),
+
+    # ══════════════════════════════════════════════════════════════
+    # DIMENSIÓN 5 — OPORTUNIDAD ESTRATÉGICA (6 indicadores)
+    # ══════════════════════════════════════════════════════════════
+
+    Indicator(
+        code        = "OPP_01",
+        name        = "PIB per Cápita (USD corrientes)",
+        dimension   = "opportunity",
+        source      = "World Bank",
+        source_url  = "https://data.worldbank.org",
+        input_type  = "api",
+        update_freq = "anual",
+        api_key     = "NY.GDP.PCAP.CD",
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = 500.0,
+        max_val     = 80000.0,
+        description = "PIB per cápita en USD. Proxy del tamaño y poder adquisitivo del mercado.",
+    ),
+    Indicator(
+        code        = "OPP_02",
+        name        = "Crecimiento Proyectado del Sector (%)",
+        dimension   = "opportunity",
+        source      = "Evaluación del analista",
+        source_url  = "",
+        input_type  = "manual",
+        update_freq = "por encargo",
+        api_key     = None,
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = -5.0,
+        max_val     = 20.0,
+        description = (
+            "Tasa de crecimiento proyectada del sector específico "
+            "en ese país a 3-5 años. Basarse en: informes sectoriales, "
+            "CEPAL, bancos de desarrollo, informes de bancos de inversión. "
+            "Porcentaje anual."
+        ),
+    ),
+    Indicator(
+        code        = "OPP_03",
+        name        = "Tamaño del Mercado Objetivo (USD millones)",
+        dimension   = "opportunity",
+        source      = "Evaluación del analista",
+        source_url  = "",
+        input_type  = "manual",
+        update_freq = "por encargo",
+        api_key     = None,
+        normalizer  = "normalize_range",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 100000.0,
+        description = (
+            "Tamaño estimado del mercado objetivo en USD millones. "
+            "Para minería: valor de producción anual del mineral. "
+            "Para energía: mercado de generación del país. "
+            "Para infra: pipeline de proyectos públicos. "
+            "Para tech: mercado digital total addressable."
+        ),
+    ),
+    Indicator(
+        code        = "OPP_04",
+        name        = "Incentivos a la Inversión Extranjera Directa",
+        dimension   = "opportunity",
+        source      = "Evaluación del analista",
+        source_url  = "",
+        input_type  = "manual",
+        update_freq = "por encargo",
+        api_key     = None,
+        normalizer  = "normalize_manual_opportunity",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 10.0,
+        description = (
+            "Evaluación de incentivos formales a la IED: zonas "
+            "económicas especiales, exenciones tributarias, "
+            "garantías de estabilidad jurídica, regímenes de "
+            "importación preferencial para equipos. Escala 0-10."
+        ),
+    ),
+    Indicator(
+        code        = "OPP_05",
+        name        = "Afinidad Cultural e Idiomática",
+        dimension   = "opportunity",
+        source      = "Evaluación del analista",
+        source_url  = "",
+        input_type  = "manual",
+        update_freq = "por encargo",
+        api_key     = None,
+        normalizer  = "normalize_manual_opportunity",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 10.0,
+        description = (
+            "Afinidad del país destino con el país de origen del "
+            "cliente: idioma compartido, similitud de marcos legales, "
+            "diáspora empresarial establecida, vínculos históricos, "
+            "distancia psíquica percibida. Escala 0-10."
+        ),
+    ),
+    Indicator(
+        code        = "OPP_06",
+        name        = "Acceso a Financiamiento Multilateral",
+        dimension   = "opportunity",
+        source      = "Evaluación del analista",
+        source_url  = "",
+        input_type  = "manual",
+        update_freq = "por encargo",
+        api_key     = None,
+        normalizer  = "normalize_manual_opportunity",
+        direction   = "positive",
+        min_val     = 0.0,
+        max_val     = 10.0,
+        description = (
+            "Disponibilidad de financiamiento multilateral para "
+            "el proyecto: BID, BM/IFC, CAF, ADB, BERD según región. "
+            "Considera si el sector y país son elegibles y si hay "
+            "líneas de crédito activas. Escala 0-10."
+        ),
+        sector_notes = "Especialmente relevante para infraestructura y energía renovable.",
+    ),
+]
+
+# ── ACCESO RÁPIDO ─────────────────────────────────────────────────
+INDICATOR_MAP  = {ind.code: ind for ind in INDICATORS}
+BY_DIMENSION   = {}
+for ind in INDICATORS:
+    BY_DIMENSION.setdefault(ind.dimension, []).append(ind)
+
+API_INDICATORS    = [i for i in INDICATORS if i.input_type == "api"]
+MANUAL_INDICATORS = [i for i in INDICATORS if i.input_type == "manual"]
+
+==> ./data/all_countries.py <==
+# data/all_countries.py
+# Catálogo completo de países del mundo con ISO codes y monedas.
+# Cubre ~195 países para el mapa interactivo.
+# ─────────────────────────────────────────────────────────────────
+
+ALL_COUNTRIES = {
+    # ── AMÉRICA LATINA Y EL CARIBE ────────────────────────────────
+    "Argentina":          {"iso2":"AR","iso3":"ARG","region":"latin_america","currency":"ARS","fx_pair":"ARSUSD=X"},
+    "Bolivia":            {"iso2":"BO","iso3":"BOL","region":"latin_america","currency":"BOB","fx_pair":"BOBUSD=X"},
+    "Brasil":             {"iso2":"BR","iso3":"BRA","region":"latin_america","currency":"BRL","fx_pair":"BRLUSD=X"},
+    "Chile":              {"iso2":"CL","iso3":"CHL","region":"latin_america","currency":"CLP","fx_pair":"CLPUSD=X"},
+    "Colombia":           {"iso2":"CO","iso3":"COL","region":"latin_america","currency":"COP","fx_pair":"COPUSD=X"},
+    "Costa Rica":         {"iso2":"CR","iso3":"CRI","region":"latin_america","currency":"CRC","fx_pair":"CRCUSD=X"},
+    "Cuba":               {"iso2":"CU","iso3":"CUB","region":"latin_america","currency":"CUP","fx_pair":None},
+    "Ecuador":            {"iso2":"EC","iso3":"ECU","region":"latin_america","currency":"USD","fx_pair":None},
+    "El Salvador":        {"iso2":"SV","iso3":"SLV","region":"latin_america","currency":"USD","fx_pair":None},
+    "Guatemala":          {"iso2":"GT","iso3":"GTM","region":"latin_america","currency":"GTQ","fx_pair":"GTQUSD=X"},
+    "Honduras":           {"iso2":"HN","iso3":"HND","region":"latin_america","currency":"HNL","fx_pair":"HNLUSD=X"},
+    "Jamaica":            {"iso2":"JM","iso3":"JAM","region":"latin_america","currency":"JMD","fx_pair":"JMDUSD=X"},
+    "Mexico":             {"iso2":"MX","iso3":"MEX","region":"latin_america","currency":"MXN","fx_pair":"MXNUSD=X"},
+    "Nicaragua":          {"iso2":"NI","iso3":"NIC","region":"latin_america","currency":"NIO","fx_pair":"NIOUSD=X"},
+    "Panama":             {"iso2":"PA","iso3":"PAN","region":"latin_america","currency":"USD","fx_pair":None},
+    "Paraguay":           {"iso2":"PY","iso3":"PRY","region":"latin_america","currency":"PYG","fx_pair":"PYGUSD=X"},
+    "Peru":               {"iso2":"PE","iso3":"PER","region":"latin_america","currency":"PEN","fx_pair":"PENUSD=X"},
+    "Rep. Dominicana":    {"iso2":"DO","iso3":"DOM","region":"latin_america","currency":"DOP","fx_pair":"DOPUSD=X"},
+    "Trinidad y Tobago":  {"iso2":"TT","iso3":"TTO","region":"latin_america","currency":"TTD","fx_pair":"TTDUSD=X"},
+    "Uruguay":            {"iso2":"UY","iso3":"URY","region":"latin_america","currency":"UYU","fx_pair":"UYUUSD=X"},
+    "Venezuela":          {"iso2":"VE","iso3":"VEN","region":"latin_america","currency":"VES","fx_pair":None},
+
+    # ── NORTEAMÉRICA ──────────────────────────────────────────────
+    "Canada":             {"iso2":"CA","iso3":"CAN","region":"north_america","currency":"CAD","fx_pair":"CADUSD=X"},
+    "Estados Unidos":     {"iso2":"US","iso3":"USA","region":"north_america","currency":"USD","fx_pair":None},
+
+    # ── EUROPA OCCIDENTAL ─────────────────────────────────────────
+    "Alemania":           {"iso2":"DE","iso3":"DEU","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Austria":            {"iso2":"AT","iso3":"AUT","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Belgica":            {"iso2":"BE","iso3":"BEL","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Dinamarca":          {"iso2":"DK","iso3":"DNK","region":"europe","currency":"DKK","fx_pair":"DKKUSD=X"},
+    "Espana":             {"iso2":"ES","iso3":"ESP","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Finlandia":          {"iso2":"FI","iso3":"FIN","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Francia":            {"iso2":"FR","iso3":"FRA","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Grecia":             {"iso2":"GR","iso3":"GRC","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Irlanda":            {"iso2":"IE","iso3":"IRL","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Italia":             {"iso2":"IT","iso3":"ITA","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Luxemburgo":         {"iso2":"LU","iso3":"LUX","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Noruega":            {"iso2":"NO","iso3":"NOR","region":"europe","currency":"NOK","fx_pair":"NOKUSD=X"},
+    "Paises Bajos":       {"iso2":"NL","iso3":"NLD","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Portugal":           {"iso2":"PT","iso3":"PRT","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Reino Unido":        {"iso2":"GB","iso3":"GBR","region":"europe","currency":"GBP","fx_pair":"GBPUSD=X"},
+    "Suecia":             {"iso2":"SE","iso3":"SWE","region":"europe","currency":"SEK","fx_pair":"SEKUSD=X"},
+    "Suiza":              {"iso2":"CH","iso3":"CHE","region":"europe","currency":"CHF","fx_pair":"CHFUSD=X"},
+
+    # ── EUROPA CENTRAL Y DEL ESTE ─────────────────────────────────
+    "Bulgaria":           {"iso2":"BG","iso3":"BGR","region":"europe","currency":"BGN","fx_pair":"BGNUSD=X"},
+    "Croacia":            {"iso2":"HR","iso3":"HRV","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Eslovaquia":         {"iso2":"SK","iso3":"SVK","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Eslovenia":          {"iso2":"SI","iso3":"SVN","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Estonia":            {"iso2":"EE","iso3":"EST","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Hungria":            {"iso2":"HU","iso3":"HUN","region":"europe","currency":"HUF","fx_pair":"HUFUSD=X"},
+    "Latvia":             {"iso2":"LV","iso3":"LVA","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Lituania":           {"iso2":"LT","iso3":"LTU","region":"europe","currency":"EUR","fx_pair":"EURUSD=X"},
+    "Polonia":            {"iso2":"PL","iso3":"POL","region":"europe","currency":"PLN","fx_pair":"PLNUSD=X"},
+    "Rep. Checa":         {"iso2":"CZ","iso3":"CZE","region":"europe","currency":"CZK","fx_pair":"CZKUSD=X"},
+    "Rumania":            {"iso2":"RO","iso3":"ROU","region":"europe","currency":"RON","fx_pair":"RONUSD=X"},
+    "Serbia":             {"iso2":"RS","iso3":"SRB","region":"europe","currency":"RSD","fx_pair":"RSDUSD=X"},
+    "Ucrania":            {"iso2":"UA","iso3":"UKR","region":"europe","currency":"UAH","fx_pair":"UAHUSD=X"},
+
+    # ── RUSIA Y ASIA CENTRAL ──────────────────────────────────────
+    "Azerbaiyan":         {"iso2":"AZ","iso3":"AZE","region":"central_asia","currency":"AZN","fx_pair":"AZNUSD=X"},
+    "Kazajistan":         {"iso2":"KZ","iso3":"KAZ","region":"central_asia","currency":"KZT","fx_pair":"KZTUSD=X"},
+    "Russia":             {"iso2":"RU","iso3":"RUS","region":"europe","currency":"RUB","fx_pair":"RUBUSD=X"},
+    "Turkmenistan":       {"iso2":"TM","iso3":"TKM","region":"central_asia","currency":"TMT","fx_pair":None},
+    "Uzbekistan":         {"iso2":"UZ","iso3":"UZB","region":"central_asia","currency":"UZS","fx_pair":None},
+
+    # ── MEDIO ORIENTE ─────────────────────────────────────────────
+    "Arabia Saudita":     {"iso2":"SA","iso3":"SAU","region":"middle_east","currency":"SAR","fx_pair":"SARUSD=X"},
+    "Emiratos Arabes":    {"iso2":"AE","iso3":"ARE","region":"middle_east","currency":"AED","fx_pair":"AEDUSD=X"},
+    "Iran":               {"iso2":"IR","iso3":"IRN","region":"middle_east","currency":"IRR","fx_pair":None},
+    "Iraq":               {"iso2":"IQ","iso3":"IRQ","region":"middle_east","currency":"IQD","fx_pair":"IQDUSD=X"},
+    "Israel":             {"iso2":"IL","iso3":"ISR","region":"middle_east","currency":"ILS","fx_pair":"ILSUSD=X"},
+    "Jordan":             {"iso2":"JO","iso3":"JOR","region":"middle_east","currency":"JOD","fx_pair":"JODUSD=X"},
+    "Kuwait":             {"iso2":"KW","iso3":"KWT","region":"middle_east","currency":"KWD","fx_pair":"KWDUSD=X"},
+    "Libano":             {"iso2":"LB","iso3":"LBN","region":"middle_east","currency":"LBP","fx_pair":None},
+    "Oman":               {"iso2":"OM","iso3":"OMN","region":"middle_east","currency":"OMR","fx_pair":"OMRUSD=X"},
+    "Qatar":              {"iso2":"QA","iso3":"QAT","region":"middle_east","currency":"QAR","fx_pair":"QARUSD=X"},
+    "Siria":              {"iso2":"SY","iso3":"SYR","region":"middle_east","currency":"SYP","fx_pair":None},
+    "Turquia":            {"iso2":"TR","iso3":"TUR","region":"middle_east","currency":"TRY","fx_pair":"TRYUSD=X"},
+    "Yemen":              {"iso2":"YE","iso3":"YEM","region":"middle_east","currency":"YER","fx_pair":None},
+
+    # ── ASIA DEL SUR ──────────────────────────────────────────────
+    "Afghanistan":        {"iso2":"AF","iso3":"AFG","region":"asia_pacific","currency":"AFN","fx_pair":None},
+    "Bangladesh":         {"iso2":"BD","iso3":"BGD","region":"asia_pacific","currency":"BDT","fx_pair":"BDTUSD=X"},
+    "India":              {"iso2":"IN","iso3":"IND","region":"asia_pacific","currency":"INR","fx_pair":"INRUSD=X"},
+    "Nepal":              {"iso2":"NP","iso3":"NPL","region":"asia_pacific","currency":"NPR","fx_pair":"NPRUSD=X"},
+    "Pakistan":           {"iso2":"PK","iso3":"PAK","region":"asia_pacific","currency":"PKR","fx_pair":"PKRUSD=X"},
+    "Sri Lanka":          {"iso2":"LK","iso3":"LKA","region":"asia_pacific","currency":"LKR","fx_pair":"LKRUSD=X"},
+
+    # ── ASIA ORIENTAL ─────────────────────────────────────────────
+    "China":              {"iso2":"CN","iso3":"CHN","region":"asia_pacific","currency":"CNY","fx_pair":"CNYUSD=X"},
+    "Corea del Norte":    {"iso2":"KP","iso3":"PRK","region":"asia_pacific","currency":"KPW","fx_pair":None},
+    "Corea del Sur":      {"iso2":"KR","iso3":"KOR","region":"asia_pacific","currency":"KRW","fx_pair":"KRWUSD=X"},
+    "Japon":              {"iso2":"JP","iso3":"JPN","region":"asia_pacific","currency":"JPY","fx_pair":"JPYUSD=X"},
+    "Mongolia":           {"iso2":"MN","iso3":"MNG","region":"asia_pacific","currency":"MNT","fx_pair":"MNTUSD=X"},
+    "Taiwan":             {"iso2":"TW","iso3":"TWN","region":"asia_pacific","currency":"TWD","fx_pair":"TWDUSD=X"},
+
+    # ── ASIA DEL SURESTE ──────────────────────────────────────────
+    "Birmania":           {"iso2":"MM","iso3":"MMR","region":"asia_pacific","currency":"MMK","fx_pair":None},
+    "Camboya":            {"iso2":"KH","iso3":"KHM","region":"asia_pacific","currency":"KHR","fx_pair":"KHRUSD=X"},
+    "Filipinas":          {"iso2":"PH","iso3":"PHL","region":"asia_pacific","currency":"PHP","fx_pair":"PHPUSD=X"},
+    "Indonesia":          {"iso2":"ID","iso3":"IDN","region":"asia_pacific","currency":"IDR","fx_pair":"IDRUSD=X"},
+    "Laos":               {"iso2":"LA","iso3":"LAO","region":"asia_pacific","currency":"LAK","fx_pair":None},
+    "Malasia":            {"iso2":"MY","iso3":"MYS","region":"asia_pacific","currency":"MYR","fx_pair":"MYRUSD=X"},
+    "Singapur":           {"iso2":"SG","iso3":"SGP","region":"asia_pacific","currency":"SGD","fx_pair":"SGDUSD=X"},
+    "Tailandia":          {"iso2":"TH","iso3":"THA","region":"asia_pacific","currency":"THB","fx_pair":"THBUSD=X"},
+    "Timor-Leste":        {"iso2":"TL","iso3":"TLS","region":"asia_pacific","currency":"USD","fx_pair":None},
+    "Vietnam":            {"iso2":"VN","iso3":"VNM","region":"asia_pacific","currency":"VND","fx_pair":"VNDUSD=X"},
+
+    # ── OCEANÍA ───────────────────────────────────────────────────
+    "Australia":          {"iso2":"AU","iso3":"AUS","region":"asia_pacific","currency":"AUD","fx_pair":"AUDUSD=X"},
+    "Nueva Zelanda":      {"iso2":"NZ","iso3":"NZL","region":"asia_pacific","currency":"NZD","fx_pair":"NZDUSD=X"},
+    "Papua Nueva Guinea": {"iso2":"PG","iso3":"PNG","region":"asia_pacific","currency":"PGK","fx_pair":"PGKUSD=X"},
+
+    # ── AFRICA DEL NORTE ──────────────────────────────────────────
+    "Argelia":            {"iso2":"DZ","iso3":"DZA","region":"africa","currency":"DZD","fx_pair":"DZDUSD=X"},
+    "Egipto":             {"iso2":"EG","iso3":"EGY","region":"africa","currency":"EGP","fx_pair":"EGPUSD=X"},
+    "Libia":              {"iso2":"LY","iso3":"LBY","region":"africa","currency":"LYD","fx_pair":None},
+    "Marruecos":          {"iso2":"MA","iso3":"MAR","region":"africa","currency":"MAD","fx_pair":"MADUSD=X"},
+    "Sudan":              {"iso2":"SD","iso3":"SDN","region":"africa","currency":"SDG","fx_pair":None},
+    "Tunez":              {"iso2":"TN","iso3":"TUN","region":"africa","currency":"TND","fx_pair":"TNDUSD=X"},
+
+    # ── AFRICA SUBSAHARIANA ───────────────────────────────────────
+    "Angola":             {"iso2":"AO","iso3":"AGO","region":"africa","currency":"AOA","fx_pair":"AOAUSD=X"},
+    "Camerun":            {"iso2":"CM","iso3":"CMR","region":"africa","currency":"XAF","fx_pair":None},
+    "Congo RDC":          {"iso2":"CD","iso3":"COD","region":"africa","currency":"CDF","fx_pair":None},
+    "Costa de Marfil":    {"iso2":"CI","iso3":"CIV","region":"africa","currency":"XOF","fx_pair":None},
+    "Etiopia":            {"iso2":"ET","iso3":"ETH","region":"africa","currency":"ETB","fx_pair":"ETBUSD=X"},
+    "Ghana":              {"iso2":"GH","iso3":"GHA","region":"africa","currency":"GHS","fx_pair":"GHSUSD=X"},
+    "Guinea Ecuatorial":  {"iso2":"GQ","iso3":"GNQ","region":"africa","currency":"XAF","fx_pair":None},
+    "Kenya":              {"iso2":"KE","iso3":"KEN","region":"africa","currency":"KES","fx_pair":"KESUSD=X"},
+    "Madagascar":         {"iso2":"MG","iso3":"MDG","region":"africa","currency":"MGA","fx_pair":None},
+    "Mozambique":         {"iso2":"MZ","iso3":"MOZ","region":"africa","currency":"MZN","fx_pair":"MZNUSD=X"},
+    "Nigeria":            {"iso2":"NG","iso3":"NGA","region":"africa","currency":"NGN","fx_pair":"NGNUSD=X"},
+    "Rwanda":             {"iso2":"RW","iso3":"RWA","region":"africa","currency":"RWF","fx_pair":None},
+    "Senegal":            {"iso2":"SN","iso3":"SEN","region":"africa","currency":"XOF","fx_pair":None},
+    "Sudafrica":          {"iso2":"ZA","iso3":"ZAF","region":"africa","currency":"ZAR","fx_pair":"ZARUSD=X"},
+    "Tanzania":           {"iso2":"TZ","iso3":"TZA","region":"africa","currency":"TZS","fx_pair":"TZSUSD=X"},
+    "Uganda":             {"iso2":"UG","iso3":"UGA","region":"africa","currency":"UGX","fx_pair":"UGXUSD=X"},
+    "Zambia":             {"iso2":"ZM","iso3":"ZMB","region":"africa","currency":"ZMW","fx_pair":"ZMWUSD=X"},
+    "Zimbabwe":           {"iso2":"ZW","iso3":"ZWE","region":"africa","currency":"ZWL","fx_pair":None},
+}
+
+# ISO3 → nombre del país (para el mapa)
+ISO3_TO_NAME = {v["iso3"]: k for k, v in ALL_COUNTRIES.items()}
+
+# ISO2 → nombre del país
+ISO2_TO_NAME = {v["iso2"]: k for k, v in ALL_COUNTRIES.items()}
+
+def get_country(name: str) -> dict:
+    if name not in ALL_COUNTRIES:
+        raise ValueError(
+            f"País '{name}' no encontrado. "
+            f"Disponibles: {list(ALL_COUNTRIES.keys())}"
+        )
+    return ALL_COUNTRIES[name]
+
+def get_by_iso3(iso3: str) -> tuple:
+    """Retorna (nombre, datos) por código ISO3."""
+    name = ISO3_TO_NAME.get(iso3)
+    if name:
+        return name, ALL_COUNTRIES[name]
+    return None, None
+
+==> ./engine/scoring.py <==
+# engine/scoring.py
+# Motor de cálculo del IRP — ahora guarda el año de cada dato.
+# ─────────────────────────────────────────────────────────────────
+
+from dataclasses import dataclass, field
+from typing      import Dict, Optional
+from datetime    import datetime
+
+from config             import SECTOR_WEIGHTS
+from data.indicators    import INDICATORS, BY_DIMENSION
+from engine.normalizers import apply
+
+
+DIMENSION_NAMES = {
+    "political":   "Político e Institucional",
+    "economic":    "Económico y Financiero",
+    "business":    "Ambiente de Negocios",
+    "social":      "Social y Reputacional",
+    "opportunity": "Oportunidad Estratégica",
+}
+
+
+@dataclass
+class IndicatorResult:
+    code:        str
+    name:        str
+    raw_value:   Optional[float]
+    score:       Optional[float]
+    data_year:   Optional[int]    # año del dato (puede diferir del año del análisis)
+    source:      str
+    update_freq: str
+    input_type:  str              # "api" | "manual"
+
+
+@dataclass
+class DimensionResult:
+    key:             str
+    name:            str
+    indicators:      Dict[str, IndicatorResult]
+    dimension_score: Optional[float]
+    coverage_pct:    float
+
+
+@dataclass
+class IRPResult:
+    country:           str
+    sector:            str
+    analysis_year:     int          # año del análisis (referencia)
+    dimensions:        Dict[str, DimensionResult]
+    irp_score:         Optional[float]
+    risk_level:        str
+    computed_at:       str
+    data_coverage_pct: float
+    data_years:        Dict[str, int]  # {código: año} de cada dato automático
+
+
+class ScoringEngine:
+
+    def compute(
+        self,
+        country:     str,
+        sector:      str,
+        analysis_year: int,
+        auto_data:   dict,    # {"POL_01": {"value": x, "year": y}, ...}
+        manual_data: dict,    # {"POL_06": valor, ...}
+    ) -> IRPResult:
+
+        if sector not in SECTOR_WEIGHTS:
+            raise ValueError(
+                f"Sector '{sector}' no existe. "
+                f"Opciones: {list(SECTOR_WEIGHTS.keys())}"
+            )
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+        # Extraemos valores y años del dict de datos automáticos
+        auto_values = {}
+        auto_years  = {}
+        for k, v in auto_data.items():
+            if k.startswith("_"):
+                continue
+            if isinstance(v, dict):
+                auto_values[k] = v.get("value")
+                auto_years[k]  = v.get("year")
+            else:
+                auto_values[k] = v   # compatibilidad con formato plano
+
+        # Combinamos: automáticos + manuales (manuales tienen prioridad)
+        all_values = {**auto_values, **manual_data}
+
+        # Normalizamos
+        indicator_results = self._normalize_all(all_values, auto_years, now)
+
+        # Agrupamos por dimensión
+        dimensions = self._group_by_dimension(indicator_results)
+
+        # Score total ponderado
+        weights     = SECTOR_WEIGHTS[sector]
+        dim_scores  = []
+        dim_weights = []
+
+        for dim_key, weight in weights.items():
+            dim = dimensions.get(dim_key)
+            if dim and dim.dimension_score is not None:
+                dim_scores.append(dim.dimension_score * weight)
+                dim_weights.append(weight)
+
+        if sum(dim_weights) >= 0.5:
+            factor    = sum(dim_weights)
+            irp_score = round(sum(dim_scores) / factor, 2)
+        else:
+            irp_score = None
+
+        risk_level = self._get_risk_level(irp_score)
+
+        all_ind   = list(indicator_results.values())
+        with_data = [i for i in all_ind if i.score is not None]
+        coverage  = round(len(with_data) / len(all_ind) * 100, 1) if all_ind else 0
+
+        return IRPResult(
+            country           = country,
+            sector            = sector,
+            analysis_year     = analysis_year,
+            dimensions        = dimensions,
+            irp_score         = irp_score,
+            risk_level        = risk_level,
+            computed_at       = now,
+            data_coverage_pct = coverage,
+            data_years        = {k: v for k, v in auto_years.items() if v},
+        )
+
+    def _normalize_all(
+        self,
+        data:       dict,
+        auto_years: dict,
+        now:        str,
+    ) -> Dict[str, IndicatorResult]:
+
+        results = {}
+        for ind in INDICATORS:
+            raw = data.get(ind.code)
+
+            # Para el rating soberano (string), no convertir a float
+            if raw is not None and ind.normalizer != "normalize_sovereign_rating":
+                try:
+                    raw = float(raw)
+                except (ValueError, TypeError):
+                    raw = None
+
+            score = apply(
+                indicator_code  = ind.code,
+                raw_value       = raw,
+                normalizer_name = ind.normalizer,
+                min_val         = ind.min_val,
+                max_val         = ind.max_val,
+                direction       = ind.direction,
+            )
+
+            # Año del dato: automático si está disponible, "manual" si no
+            data_year = auto_years.get(ind.code)
+
+            results[ind.code] = IndicatorResult(
+                code        = ind.code,
+                name        = ind.name,
+                raw_value   = raw,
+                score       = score,
+                data_year   = data_year,
+                source      = ind.source,
+                update_freq = ind.update_freq,
+                input_type  = ind.input_type,
+            )
+
+        return results
+
+    def _group_by_dimension(
+        self, indicator_results: Dict[str, IndicatorResult]
+    ) -> Dict[str, DimensionResult]:
+
+        dimensions = {}
+        for dim_key, dim_name in DIMENSION_NAMES.items():
+            dim_indicators = BY_DIMENSION.get(dim_key, [])
+            ind_results    = {
+                ind.code: indicator_results[ind.code]
+                for ind in dim_indicators
+                if ind.code in indicator_results
+            }
+            with_score = [
+                r.score for r in ind_results.values()
+                if r.score is not None
+            ]
+            dim_score = (
+                round(sum(with_score) / len(with_score), 2)
+                if with_score else None
+            )
+            coverage = (
+                round(len(with_score) / len(ind_results) * 100, 1)
+                if ind_results else 0
+            )
+            dimensions[dim_key] = DimensionResult(
+                key             = dim_key,
+                name            = dim_name,
+                indicators      = ind_results,
+                dimension_score = dim_score,
+                coverage_pct    = coverage,
+            )
+        return dimensions
+
+    def _get_risk_level(self, score: Optional[float]) -> str:
+        if score is None:   return "insufficient_data"
+        if score >= 70:     return "viable"
+        if score >= 40:     return "conditioned"
+        return "not_viable"
+
+==> ./engine/recommendations.py <==
+# engine/recommendations.py
+# Motor de recomendaciones de PolitRisk Pro.
+# Genera análisis extensos, explicativos y profesionales.
+# ─────────────────────────────────────────────────────────────────
+
+from dataclasses import dataclass, field
+from typing      import List, Optional
+from engine.scoring   import IRPResult
+from engine.financial import EFAResult, format_usd
+from config           import SECTORS
+
+
+@dataclass
+class Condition:
+    category:     str   # "contractual" | "financial" | "operational"
+    text:         str
+    rationale:    str   # explicación de por qué se recomienda
+    priority:     str   # "obligatoria" | "recomendada"
+    triggered_by: str
+
+
+@dataclass
+class RecommendationResult:
+    viability:          str
+    executive_summary:  str   # párrafo ejecutivo
+    political_analysis: str   # análisis dimensión política
+    economic_analysis:  str   # análisis dimensión económica
+    business_analysis:  str   # análisis dimensión negocios
+    social_analysis:    str   # análisis dimensión social
+    opportunity_analysis: str # análisis dimensión oportunidad
+    conditions:         List[Condition]
+    efa_summary:        Optional[str]
+    review_schedule:    str
+    analyst_notes:      str = ""
+    analyst_approved:   bool = False
+
+
+def generate(
+    irp:        IRPResult,
+    asset_type: str,
+    efa:        Optional[EFAResult] = None,
+) -> RecommendationResult:
+
+    score   = irp.irp_score or 0
+    dims    = irp.dimensions
+    sector  = SECTORS.get(irp.sector, irp.sector)
+    country = irp.country
+
+    pol  = dims.get("political")
+    eco  = dims.get("economic")
+    biz  = dims.get("business")
+    soc  = dims.get("social")
+    opp  = dims.get("opportunity")
+
+    pol_score = pol.dimension_score if pol else None
+    eco_score = eco.dimension_score if eco else None
+    biz_score = biz.dimension_score if biz else None
+    soc_score = soc.dimension_score if soc else None
+    opp_score = opp.dimension_score if opp else None
+
+    conditions = []
+
+    # ── VIABILIDAD ────────────────────────────────────────────────
+    viability, executive_summary = _executive_summary(
+        score, asset_type, irp.sector, country, pol_score, eco_score, soc_score
+    )
+
+    # ── ANÁLISIS POR DIMENSIÓN ────────────────────────────────────
+    political_analysis  = _political_analysis(country, irp.sector, pol, pol_score)
+    economic_analysis   = _economic_analysis(country, irp.sector, eco, eco_score, efa)
+    business_analysis   = _business_analysis(country, irp.sector, biz, biz_score)
+    social_analysis     = _social_analysis(country, irp.sector, soc, soc_score)
+    opportunity_analysis= _opportunity_analysis(country, irp.sector, opp, opp_score)
+
+    # ── CONDICIONES ───────────────────────────────────────────────
+    conditions = _generate_conditions(irp, asset_type, efa,
+                                      pol_score, eco_score, soc_score)
+
+    # ── EFA SUMMARY ───────────────────────────────────────────────
+    efa_summary = _efa_summary(efa, country, irp.sector) if efa else None
+
+    # ── REVISIÓN ──────────────────────────────────────────────────
+    review_schedule = _review_schedule(score, irp.sector, country)
+
+    return RecommendationResult(
+        viability            = viability,
+        executive_summary    = executive_summary,
+        political_analysis   = political_analysis,
+        economic_analysis    = economic_analysis,
+        business_analysis    = business_analysis,
+        social_analysis      = social_analysis,
+        opportunity_analysis = opportunity_analysis,
+        conditions           = conditions,
+        efa_summary          = efa_summary,
+        review_schedule      = review_schedule,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────
+# RESUMEN EJECUTIVO
+# ─────────────────────────────────────────────────────────────────
+
+def _executive_summary(score, asset_type, sector, country, pol_score, eco_score, soc_score):
+
+    sector_name = SECTORS.get(sector, sector)
+
+    if score >= 70:
+        viability = "VIABLE"
+        text = (
+            f"El análisis de riesgo político para {country} en el sector de {sector_name} "
+            f"arroja un Índice de Riesgo Político (IRP) de {score:.1f} sobre 100, lo que sitúa "
+            f"a este mercado dentro del rango de condiciones favorables para la internacionalización. "
+            f"El marco institucional presenta solidez suficiente para sostener operaciones de mediano "
+            f"y largo plazo, con riesgos manejables mediante la aplicación de medidas de protección estándar. "
+        )
+        if pol_score and pol_score >= 65:
+            text += (
+                f"El entorno político-institucional es el principal activo del mercado, con indicadores "
+                f"de gobernanza que reflejan estabilidad estructural y predictibilidad regulatoria. "
+            )
+        if eco_score and eco_score >= 65:
+            text += (
+                f"Las condiciones macroeconómicas respaldan la decisión de entrada, con fundamentos "
+                f"financieros que reducen el riesgo de pérdida de valor por factores sistémicos. "
+            )
+        text += (
+            f"Se recomienda proceder con el plan de entrada documentando adecuadamente las cláusulas "
+            f"de protección en todos los instrumentos contractuales, y estableciendo un protocolo "
+            f"de monitoreo periódico del entorno político."
+        )
+
+    elif score >= 40:
+        viability = "CONDICIONADO"
+        text = (
+            f"El análisis de riesgo político para {country} en el sector de {sector_name} "
+            f"arroja un Índice de Riesgo Político (IRP) de {score:.1f} sobre 100, lo que corresponde "
+            f"a un perfil de riesgo medio que hace viable el proyecto únicamente bajo condiciones "
+            f"específicas de estructuración contractual, financiera y operacional. "
+            f"El mercado presenta oportunidades genuinas, pero también vulnerabilidades estructurales "
+            f"que deben ser gestionadas activamente antes y durante la operación. "
+        )
+        if pol_score and pol_score < 55:
+            text += (
+                f"El entorno político-institucional constituye la principal fuente de incertidumbre, "
+                f"con indicadores que reflejan fragilidad en la predictibilidad regulatoria y riesgos "
+                f"de cambio unilateral de las condiciones de operación. "
+            )
+        if soc_score and soc_score < 55:
+            text += (
+                f"La conflictividad social y los factores reputacionales representan un riesgo "
+                f"operacional significativo que requiere una estrategia proactiva de relacionamiento "
+                f"con comunidades locales y grupos de interés. "
+            )
+        text += (
+            f"La recomendación es proceder con una estrategia de entrada por fases, comprometiendo "
+            f"capital de forma gradual conforme el proyecto demuestre viabilidad operacional y "
+            f"el entorno político confirme estabilidad. Todas las condiciones identificadas en este "
+            f"informe deben ser implementadas antes del desembolso inicial de capital."
+        )
+
+    else:
+        viability = "NO VIABLE"
+        text = (
+            f"El análisis de riesgo político para {country} en el sector de {sector_name} "
+            f"arroja un Índice de Riesgo Político (IRP) de {score:.1f} sobre 100, nivel que "
+            f"indica condiciones estructuralmente adversas para la internacionalización en las "
+            f"circunstancias actuales. Los riesgos político-institucionales, financieros y sociales "
+            f"identificados superan los umbrales de tolerancia recomendables para este tipo de activo "
+            f"y horizonte de inversión. "
+            f"Este análisis no recomienda proceder con el proyecto en su configuración actual. "
+            f"Si el cliente opta por avanzar de todas formas, será indispensable implementar una "
+            f"estructura de mitigación extraordinaria que incluya garantías soberanas o multilaterales, "
+            f"seguro de inversión MIGA, estructura off-shore para activos críticos, y un plan de "
+            f"salida claramente definido con umbrales de activación preestablecidos."
+        )
+
+    return viability, text
+
+
+# ─────────────────────────────────────────────────────────────────
+# ANÁLISIS POR DIMENSIÓN
+# ─────────────────────────────────────────────────────────────────
+
+def _political_analysis(country, sector, pol, pol_score):
+    if not pol or pol_score is None:
+        return "No hay datos suficientes para elaborar un análisis político detallado."
+
+    score_str = f"{pol_score:.1f}"
+    inds      = pol.indicators
+
+    # Extraemos scores individuales clave
+    corruption = inds.get("POL_01")
+    rule_of_law= inds.get("POL_02")
+    stability  = inds.get("POL_03")
+    gov_eff    = inds.get("POL_04")
+    expropr    = inds.get("POL_10")
+
+    text = f"La dimensión político-institucional obtiene un score de {score_str}/100. "
+
+    if pol_score >= 70:
+        text += (
+            f"El entorno político de {country} presenta condiciones institucionales sólidas "
+            f"que generan un marco predecible para la operación empresarial de largo plazo. "
+        )
+    elif pol_score >= 50:
+        text += (
+            f"El entorno político de {country} presenta condiciones institucionales moderadas, "
+            f"con fortalezas relevantes pero también vulnerabilidades que requieren atención específica. "
+        )
+    else:
+        text += (
+            f"El entorno político de {country} refleja debilidades institucionales significativas "
+            f"que generan incertidumbre estructural para los inversores extranjeros. "
+        )
+
+    if corruption and corruption.score is not None:
+        if corruption.score >= 65:
+            text += (
+                f"El control de la corrupción muestra niveles aceptables (score {corruption.score:.1f}), "
+                f"lo que reduce el riesgo de extracción de rentas por parte de funcionarios públicos "
+                f"y facilita la operación en un marco de cumplimiento estándar. "
+            )
+        else:
+            text += (
+                f"El control de la corrupción es un área de preocupación (score {corruption.score:.1f}), "
+                f"lo que exige protocolos de compliance robustos y una debida diligencia exhaustiva "
+                f"en todos los procesos de relacionamiento con el sector público. "
+                f"Se recomienda implementar un programa de integridad corporativa desde el inicio "
+                f"de las operaciones y documentar todas las interacciones con autoridades. "
+            )
+
+    if rule_of_law and rule_of_law.score is not None:
+        if rule_of_law.score >= 65:
+            text += (
+                f"El estado de derecho es robusto (score {rule_of_law.score:.1f}), "
+                f"lo que proporciona garantías razonables sobre la ejecución de contratos "
+                f"y la resolución de disputas a través de mecanismos judiciales locales. "
+            )
+        else:
+            text += (
+                f"El estado de derecho presenta debilidades estructurales (score {rule_of_law.score:.1f}). "
+                f"La independencia judicial es limitada y la ejecución de contratos puede ser "
+                f"lenta e impredecible. Por esta razón, todos los contratos de importancia "
+                f"deben incorporar cláusulas de arbitraje internacional que eviten la jurisdicción "
+                f"local para la resolución de disputas. "
+            )
+
+    if stability and stability.score is not None:
+        if stability.score < 50:
+            text += (
+                f"La estabilidad política es el indicador de mayor preocupación en esta dimensión "
+                f"(score {stability.score:.1f}). El país enfrenta riesgos de desestabilización "
+                f"que podrían interrumpir las operaciones o generar cambios abruptos en el marco "
+                f"regulatorio del sector. Se recomienda monitorear el ciclo electoral y los "
+                f"indicadores de conflictividad política con frecuencia trimestral. "
+            )
+
+    if expropr and expropr.score is not None:
+        expropr_risk = 100 - expropr.score
+        if expropr_risk >= 50:
+            text += (
+                f"El riesgo de expropiación o renegociación unilateral de contratos es elevado "
+                f"para el sector {SECTORS.get(sector, sector)}, lo que constituye la principal "
+                f"amenaza para la integridad del capital invertido. "
+                f"Es imperativo estructurar el proyecto con mecanismos de protección multilateral "
+                f"y asegurar que los contratos estén amparados por tratados bilaterales de inversión vigentes. "
+            )
+
+    if sector == "mining":
+        text += (
+            f"Para el sector minero específicamente, el riesgo regulatorio más relevante es "
+            f"la modificación del régimen de concesiones y royalties. El analista debe monitorear "
+            f"activamente el debate legislativo en torno a la renta minera y las posiciones "
+            f"de los principales partidos respecto a la propiedad de los recursos naturales. "
+        )
+    elif sector in ("renewable", "infra"):
+        text += (
+            f"En el sector de infraestructura y energía, el riesgo político se manifiesta "
+            f"principalmente a través de renegociaciones tarifarias y cambios en los marcos "
+            f"de concesiones públicas. La relación con la contraparte soberana debe estar "
+            f"respaldada por mecanismos de garantía internacionales desde el inicio del proyecto. "
+        )
+
+    return text
+
+
+def _economic_analysis(country, sector, eco, eco_score, efa):
+    if not eco or eco_score is None:
+        return "No hay datos suficientes para elaborar un análisis económico detallado."
+
+    score_str = f"{eco_score:.1f}"
+    inds      = eco.indicators
+
+    inflation  = inds.get("ECO_01")
+    gdp_growth = inds.get("ECO_02")
+    debt       = inds.get("ECO_03")
+    rating     = inds.get("ECO_05")
+    cds        = inds.get("ECO_06")
+    fx_vol     = inds.get("ECO_07")
+
+    text = f"La dimensión económico-financiera obtiene un score de {score_str}/100. "
+
+    if eco_score >= 70:
+        text += (
+            f"Los fundamentos macroeconómicos de {country} son sólidos y proporcionan "
+            f"un contexto favorable para la operación empresarial y la repatriación de utilidades. "
+        )
+    elif eco_score >= 50:
+        text += (
+            f"Los fundamentos macroeconómicos de {country} son moderados, con algunos indicadores "
+            f"que presentan vulnerabilidades que el inversor debe considerar en su estructuración financiera. "
+        )
+    else:
+        text += (
+            f"Los fundamentos macroeconómicos de {country} presentan fragilidades significativas "
+            f"que se traducen en riesgos financieros directos para el proyecto. "
+        )
+
+    if inflation and inflation.score is not None:
+        inf_raw = inflation.raw_value
+        if inf_raw and inf_raw > 15:
+            text += (
+                f"La inflación proyectada de {inf_raw:.1f}% es un factor de riesgo relevante "
+                f"que erosiona el poder adquisitivo local y puede afectar los costos operacionales "
+                f"denominados en moneda local. Se recomienda indexar los contratos de largo plazo "
+                f"en dólares o incluir cláusulas de ajuste por inflación. "
+            )
+        elif inf_raw and inf_raw <= 5:
+            text += (
+                f"La inflación proyectada de {inf_raw:.1f}% se mantiene dentro de rangos manejables, "
+                f"lo que favorece la planificación financiera de largo plazo. "
+            )
+
+    if gdp_growth and gdp_growth.raw_value is not None:
+        g = gdp_growth.raw_value
+        if g >= 4:
+            text += (
+                f"El crecimiento del PIB proyectado de {g:.1f}% refleja un ciclo económico expansivo "
+                f"que respalda la demanda interna y el potencial de mercado del sector. "
+            )
+        elif g < 1:
+            text += (
+                f"El crecimiento del PIB de {g:.1f}% indica un ciclo económico débil que puede "
+                f"afectar la demanda interna y reducir el tamaño efectivo del mercado en el corto plazo. "
+            )
+
+    if debt and debt.raw_value is not None:
+        d = debt.raw_value
+        if d > 80:
+            text += (
+                f"La deuda pública de {d:.1f}% del PIB es elevada y genera vulnerabilidad "
+                f"ante shocks externos. Un nivel de deuda de esta magnitud puede derivar en "
+                f"presiones fiscales que el gobierno administre mediante aumentos de impuestos "
+                f"a la inversión extranjera o restricciones a la repatriación de utilidades. "
+            )
+
+    if fx_vol and fx_vol.raw_value is not None:
+        vol_pct = fx_vol.raw_value * 100
+        if vol_pct > 20:
+            text += (
+                f"La volatilidad cambiaria de {vol_pct:.1f}% en los últimos doce meses es "
+                f"significativa y representa un riesgo directo sobre los flujos de caja del proyecto "
+                f"cuando se convierten a la moneda de origen del inversor. "
+                f"La implementación de una estrategia de cobertura cambiaria es imperativa para "
+                f"proyectos con ingresos en moneda local y deuda o distribución de utilidades en dólares. "
+            )
+        else:
+            text += (
+                f"La volatilidad cambiaria de {vol_pct:.1f}% en los últimos doce meses es moderada, "
+                f"lo que reduce el riesgo de pérdida de valor por fluctuaciones del tipo de cambio. "
+            )
+
+    if efa:
+        text += (
+            f"La exposición financiera máxima estimada para este proyecto asciende a "
+            f"{format_usd(efa.efa_usd)}, equivalente al {efa.efa_pct:.1f}% de la inversión total, "
+            f"considerando el factor de riesgo político y la volatilidad cambiaria observada. "
+            f"Este parámetro debe ser el referente para definir el nivel de cobertura de seguros "
+            f"y los montos de las garantías requeridas. "
+        )
+
+    return text
+
+
+def _business_analysis(country, sector, biz, biz_score):
+    if not biz or biz_score is None:
+        return "No hay datos suficientes para elaborar un análisis del ambiente de negocios."
+
+    score_str = f"{biz_score:.1f}"
+    inds      = biz.indicators
+
+    reg_env = inds.get("BIZ_01")
+    hci     = inds.get("BIZ_04")
+    lpi     = inds.get("BIZ_05")
+    internet= inds.get("BIZ_06")
+    trace   = inds.get("BIZ_07")
+    tbis    = inds.get("BIZ_08")
+
+    text = f"La dimensión de ambiente de negocios obtiene un score de {score_str}/100. "
+
+    if biz_score >= 70:
+        text += (
+            f"El entorno regulatorio y operacional de {country} es favorable para el desarrollo "
+            f"de negocios en el sector de {SECTORS.get(sector, sector)}, con marcos normativos "
+            f"que facilitan la inversión extranjera directa. "
+        )
+    elif biz_score >= 50:
+        text += (
+            f"El entorno de negocios en {country} presenta condiciones mixtas: hay áreas que "
+            f"facilitan la operación, pero también obstáculos regulatorios y operacionales que "
+            f"incrementan los costos de entrada y los tiempos de implementación del proyecto. "
+        )
+    else:
+        text += (
+            f"El ambiente de negocios en {country} presenta dificultades estructurales que "
+            f"elevan significativamente los costos de entrada y de cumplimiento regulatorio, "
+            f"requiriendo una planificación más exhaustiva de los plazos de implementación. "
+        )
+
+    if hci and hci.raw_value is not None:
+        hci_val = hci.raw_value
+        if hci_val >= 0.7:
+            text += (
+                f"El capital humano disponible es una ventaja competitiva del mercado "
+                f"(HCI: {hci_val:.2f}), con una fuerza laboral con niveles de productividad "
+                f"potencial que facilitan la implementación de operaciones que requieren "
+                f"calificaciones técnicas especializadas. "
+            )
+        elif hci_val < 0.5:
+            text += (
+                f"La disponibilidad de capital humano calificado es limitada (HCI: {hci_val:.2f}), "
+                f"lo que puede derivar en presiones salariales para perfiles especializados "
+                f"y en la necesidad de implementar programas de capacitación local o "
+                f"recurrir a expatriados para roles técnicos clave. "
+            )
+
+    if lpi and lpi.raw_value is not None:
+        lpi_val = lpi.raw_value
+        if lpi_val >= 3.5:
+            text += (
+                f"La infraestructura logística es adecuada (LPI: {lpi_val:.2f}/5.0), "
+                f"lo que facilita el movimiento de insumos y productos en el contexto "
+                f"del sector analizado. "
+            )
+        else:
+            text += (
+                f"La infraestructura logística presenta deficiencias (LPI: {lpi_val:.2f}/5.0) "
+                f"que pueden incrementar los costos operacionales y los tiempos de abastecimiento. "
+                f"Este factor es especialmente relevante para proyectos de minería e infraestructura "
+                f"que dependen de cadenas de suministro complejas. "
+            )
+
+    if trace and trace.score is not None:
+        trace_risk = trace.raw_value
+        if trace_risk and trace_risk > 50:
+            text += (
+                f"El riesgo de soborno empresarial es elevado según el índice TRACE "
+                f"({trace_risk:.0f}/100), lo que exige la implementación de controles "
+                f"internos robustos y un programa de compliance anticorrupción que cumpla "
+                f"con los estándares de la FCPA (EE.UU.) o el UK Bribery Act, según "
+                f"la jurisdicción de origen del inversor. "
+            )
+
+    if tbis and tbis.score is not None and tbis.raw_value:
+        if tbis.raw_value >= 7:
+            text += (
+                f"La cobertura de tratados bilaterales de inversión es satisfactoria, "
+                f"lo que otorga al inversor protecciones legales adicionales frente a "
+                f"acciones gubernamentales arbitrarias, incluyendo acceso a mecanismos "
+                f"de arbitraje internacional bajo el marco CIADI o UNCITRAL. "
+            )
+        else:
+            text += (
+                f"La cobertura de tratados bilaterales de inversión es limitada entre "
+                f"{country} y el país de origen del cliente. Se recomienda verificar "
+                f"en la base de datos de UNCTAD Investment Policy Hub si existe un TBI "
+                f"vigente y, de no haberlo, estructurar el proyecto a través de una "
+                f"jurisdicción que sí tenga TBI con {country}. "
+            )
+
+    return text
+
+
+def _social_analysis(country, sector, soc, soc_score):
+    if not soc or soc_score is None:
+        return "No hay datos suficientes para elaborar un análisis social y reputacional."
+
+    score_str = f"{soc_score:.1f}"
+    inds      = soc.indicators
+
+    cpi       = inds.get("SOC_01")
+    conflicts = inds.get("SOC_02")
+    gpi       = inds.get("SOC_03")
+    rsf       = inds.get("SOC_04")
+    esg       = inds.get("SOC_07")
+    community = inds.get("SOC_08")
+
+    text = f"La dimensión social y reputacional obtiene un score de {soc_score:.1f}/100. "
+
+    if soc_score >= 70:
+        text += (
+            f"El entorno social de {country} es relativamente estable y presenta condiciones "
+            f"favorables para la operación con una licencia social sólida. "
+        )
+    elif soc_score >= 50:
+        text += (
+            f"El entorno social de {country} presenta tensiones que requieren gestión activa "
+            f"por parte del inversor, especialmente en materia de relacionamiento comunitario "
+            f"y cumplimiento de estándares ESG. "
+        )
+    else:
+        text += (
+            f"El entorno social de {country} es complejo y representa uno de los principales "
+            f"factores de riesgo operacional para el proyecto. La gestión del relacionamiento "
+            f"comunitario y la licencia social deben ser prioridades estratégicas desde el "
+            f"inicio de la planificación del proyecto. "
+        )
+
+    if cpi and cpi.raw_value is not None:
+        cpi_val = cpi.raw_value
+        if cpi_val < 40:
+            text += (
+                f"La percepción de corrupción es alta según el Índice de Transparencia Internacional "
+                f"(CPI: {cpi_val:.0f}/100), lo que implica riesgos reputacionales para empresas "
+                f"internacionales que operan en el mercado. Una asociación con actores locales "
+                f"vinculados a prácticas corruptas puede exponer al inversor a sanciones en "
+                f"su jurisdicción de origen. "
+            )
+        elif cpi_val >= 60:
+            text += (
+                f"La percepción de corrupción se mantiene en niveles manejables "
+                f"(CPI: {cpi_val:.0f}/100), lo que reduce el riesgo reputacional asociado "
+                f"a la operación en este mercado. "
+            )
+
+    if conflicts and conflicts.raw_value is not None:
+        conf_val = conflicts.raw_value
+        if conf_val > 100:
+            text += (
+                f"La conflictividad social registrada por ACLED es elevada "
+                f"({conf_val:.0f} eventos en los últimos doce meses), lo que refleja "
+                f"un tejido social bajo tensión que puede traducirse en interrupciones "
+                f"operacionales, bloqueos de acceso a instalaciones o presiones para "
+                f"renegociar acuerdos con comunidades locales. "
+            )
+
+    if sector == "mining":
+        if community and community.score is not None and community.score < 60:
+            text += (
+                f"La presión comunitaria es un factor crítico para proyectos mineros en {country}. "
+                f"La experiencia reciente en la región indica que la falta de una estrategia "
+                f"proactiva de consulta y participación comunitaria es la principal causa "
+                f"de paralización de proyectos extractivos. Se recomienda iniciar el proceso "
+                f"de consulta previa bajo el Convenio 169 de la OIT con suficiente antelación "
+                f"al inicio de operaciones, y asignar recursos específicos para un equipo "
+                f"de relacionamiento comunitario con presencia permanente en el área de influencia. "
+            )
+
+    if esg and esg.score is not None and esg.raw_value:
+        if esg.raw_value > 6:
+            text += (
+                f"El riesgo ESG sectorial es significativo en este mercado, lo que implica "
+                f"una mayor exposición a litigios ambientales, presiones regulatorias y "
+                f"escrutinio por parte de inversores institucionales con mandatos de sostenibilidad. "
+                f"Para empresas que cotizan en bolsa o que dependen de financiamiento de "
+                f"fondos ESG, este factor puede afectar el costo de capital del proyecto. "
+            )
+
+    return text
+
+
+def _opportunity_analysis(country, sector, opp, opp_score):
+    if not opp or opp_score is None:
+        return "No hay datos suficientes para elaborar un análisis de oportunidad estratégica."
+
+    score_str = f"{opp_score:.1f}"
+    inds      = opp.indicators
+
+    gdp_pc  = inds.get("OPP_01")
+    growth  = inds.get("OPP_02")
+    market  = inds.get("OPP_03")
+    ied     = inds.get("OPP_04")
+    affinity= inds.get("OPP_05")
+    multi   = inds.get("OPP_06")
+
+    text = f"La dimensión de oportunidad estratégica obtiene un score de {opp_score:.1f}/100. "
+
+    if opp_score >= 65:
+        text += (
+            f"El mercado de {country} presenta oportunidades estratégicas significativas "
+            f"para el sector de {SECTORS.get(sector, sector)}, con condiciones que justifican "
+            f"la evaluación seria de una estrategia de entrada. "
+        )
+    elif opp_score >= 45:
+        text += (
+            f"El mercado de {country} ofrece oportunidades moderadas en el sector de "
+            f"{SECTORS.get(sector, sector)}, aunque el potencial de crecimiento requiere "
+            f"una estrategia de posicionamiento bien definida para ser capturado efectivamente. "
+        )
+    else:
+        text += (
+            f"Las oportunidades estratégicas en {country} son limitadas en el horizonte "
+            f"de análisis, lo que debilita el caso de inversión desde la perspectiva "
+            f"del potencial de retorno. "
+        )
+
+    if growth and growth.raw_value is not None:
+        g = growth.raw_value
+        if g >= 6:
+            text += (
+                f"El crecimiento proyectado del sector de {g:.1f}% anual es altamente atractivo "
+                f"y posiciona a {country} como un mercado de expansión prioritario en la región. "
+                f"Este ritmo de crecimiento supera el promedio regional y sugiere que hay demanda "
+                f"insatisfecha que un actor bien posicionado puede capturar. "
+            )
+        elif g >= 3:
+            text += (
+                f"El crecimiento proyectado del sector de {g:.1f}% anual es razonable y consistente "
+                f"con un mercado en expansión gradual. "
+            )
+        else:
+            text += (
+                f"El crecimiento proyectado del sector de {g:.1f}% anual es modesto, "
+                f"lo que limita el potencial de generación de valor en el mediano plazo. "
+            )
+
+    if market and market.raw_value is not None:
+        m = market.raw_value
+        text += (
+            f"El tamaño estimado del mercado objetivo asciende a USD {m:,.0f} millones, "
+            f"lo que proporciona un campo de acción suficiente para una operación escalable. "
+        )
+
+    if ied and ied.raw_value is not None and ied.raw_value >= 6:
+        text += (
+            f"El país ofrece incentivos concretos a la inversión extranjera directa que "
+            f"pueden mejorar el retorno efectivo del proyecto, incluyendo beneficios "
+            f"tributarios o regímenes especiales para el sector analizado. "
+            f"Se recomienda verificar la vigencia y condiciones específicas de estos "
+            f"incentivos con un asesor legal local antes de la estructuración final. "
+        )
+
+    if affinity and affinity.raw_value is not None:
+        aff = affinity.raw_value
+        if aff >= 7:
+            text += (
+                f"La alta afinidad cultural e idiomática con el país de origen del cliente "
+                f"reduce la distancia psíquica y facilita el proceso de internacionalización, "
+                f"disminuyendo los costos de adaptación y los tiempos de curva de aprendizaje. "
+            )
+        elif aff < 4:
+            text += (
+                f"La distancia cultural con el país de origen del cliente es significativa, "
+                f"lo que puede incrementar los costos de adaptación y requerir mayor inversión "
+                f"en capital humano local para una integración exitosa en el mercado. "
+            )
+
+    if multi and multi.raw_value is not None and multi.raw_value >= 6:
+        text += (
+            f"La disponibilidad de financiamiento multilateral para este tipo de proyectos "
+            f"en {country} representa una ventaja adicional, ya que permite reducir la "
+            f"exposición de capital propio y mejorar la estructura de riesgo del proyecto "
+            f"al incorporar a un organismo multilateral como co-financiador. "
+        )
+
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────
+# CONDICIONES
+# ─────────────────────────────────────────────────────────────────
+
+def _generate_conditions(irp, asset_type, efa, pol_score, eco_score, soc_score):
+    conditions = []
+    score = irp.irp_score or 0
+    pol   = irp.dimensions.get("political")
+    eco   = irp.dimensions.get("economic")
+    soc   = irp.dimensions.get("social")
+
+    pol_ind = pol.indicators if pol else {}
+    eco_ind = eco.indicators if eco else {}
+    soc_ind = soc.indicators if soc else {}
+
+    # ── CONTRACTUALES ─────────────────────────────────────────────
+
+    if score < 70 or (pol_score and pol_score < 65):
+        conditions.append(Condition(
+            category     = "contractual",
+            text         = "Cláusula de arbitraje internacional en todos los contratos (CIADI, CCI o UNCITRAL)",
+            rationale    = "El marco judicial local presenta riesgos de independencia y eficiencia que hacen aconsejable resolver disputas ante tribunales arbitrales internacionales.",
+            priority     = "obligatoria",
+            triggered_by = f"IRP={score:.1f} / Dimensión política={pol_score:.1f}" if pol_score else f"IRP={score:.1f}",
+        ))
+
+    debt_ind = eco_ind.get("ECO_03")
+    if debt_ind and debt_ind.score and debt_ind.score < 50:
+        conditions.append(Condition(
+            category     = "contractual",
+            text         = "Cláusula de estabilización tributaria vinculada al régimen fiscal vigente al momento de la firma",
+            rationale    = "La vulnerabilidad fiscal del país incrementa la probabilidad de reformas impositivas que puedan afectar la rentabilidad del proyecto.",
+            priority     = "obligatoria",
+            triggered_by = f"Deuda/PIB score={debt_ind.score:.1f}",
+        ))
+
+    stab = pol_ind.get("POL_03")
+    if stab and stab.score and stab.score < 50:
+        conditions.append(Condition(
+            category     = "contractual",
+            text         = "Cláusula de fuerza mayor política con definición amplia que cubra cambios de gobierno, estados de excepción y conflictos civiles",
+            rationale    = "La volatilidad política identificada puede derivar en eventos que interrumpan las operaciones sin que medie incumplimiento de ninguna de las partes.",
+            priority     = "obligatoria",
+            triggered_by = f"Estabilidad política score={stab.score:.1f}",
+        ))
+
+    if irp.sector in ("infra", "renewable"):
+        conditions.append(Condition(
+            category     = "contractual",
+            text         = "Contrato take-or-pay con contraparte soberana o empresa pública que garantice ingresos mínimos",
+            rationale    = "Los proyectos de infraestructura y energía requieren certeza de ingresos para viabilizar el financiamiento de largo plazo.",
+            priority     = "obligatoria",
+            triggered_by = f"Sector={irp.sector}",
+        ))
+
+    # ── FINANCIERAS ───────────────────────────────────────────────
+
+    expropr = pol_ind.get("POL_10")
+    if score < 60 or (expropr and expropr.score and expropr.score < 60):
+        conditions.append(Condition(
+            category     = "financial",
+            text         = "Seguro de inversión MIGA o equivalente multilateral contra expropiación, inconvertibilidad y ruptura de contrato",
+            rationale    = "El nivel de riesgo político identificado justifica la contratación de un seguro que transfiera el riesgo de pérdida patrimonial por acción gubernamental a un organismo multilateral.",
+            priority     = "obligatoria",
+            triggered_by = f"IRP={score:.1f}",
+        ))
+
+    if efa and efa.fx_volatility and efa.fx_volatility > 0.12:
+        prio = "obligatoria" if efa.fx_volatility > 0.25 else "recomendada"
+        conditions.append(Condition(
+            category     = "financial",
+            text         = f"Estrategia de cobertura cambiaria (hedging) mediante contratos forward o opciones — volatilidad observada: {efa.fx_volatility*100:.1f}%",
+            rationale    = "La volatilidad cambiaria observada en los últimos doce meses expone los flujos de caja del proyecto a pérdidas significativas en la conversión a moneda de origen.",
+            priority     = prio,
+            triggered_by = f"Volatilidad cambiaria={efa.fx_volatility*100:.1f}%",
+        ))
+
+    if eco_score and eco_score < 55:
+        conditions.append(Condition(
+            category     = "financial",
+            text         = "Cuenta escrow offshore en jurisdicción segura para depósito de utilidades previo a repatriación",
+            rationale    = "Las condiciones macroeconómicas identificadas incrementan el riesgo de controles de capital o restricciones a la transferencia de divisas en escenarios de estrés.",
+            priority     = "recomendada",
+            triggered_by = f"Dimensión económica={eco_score:.1f}",
+        ))
+
+    if irp.sector in ("infra", "renewable", "mining"):
+        conditions.append(Condition(
+            category     = "financial",
+            text         = "Explorar financiamiento del BID, IFC/Banco Mundial o CAF para mejorar la estructura de riesgo e incorporar garantías multilaterales",
+            rationale    = "La participación de organismos multilaterales como co-financiadores reduce el riesgo de interferencia gubernamental y mejora las condiciones de acceso a capital.",
+            priority     = "recomendada",
+            triggered_by = f"Sector={irp.sector}",
+        ))
+
+    # ── OPERACIONALES ─────────────────────────────────────────────
+
+    if 40 <= score < 65:
+        conditions.append(Condition(
+            category     = "operational",
+            text         = "Estrategia de entrada por fases con inversión piloto en la primera etapa y puntos de revisión antes de escalar",
+            rationale    = "El nivel de incertidumbre del entorno aconseja validar la viabilidad operacional con una exposición de capital limitada antes de comprometer la inversión total.",
+            priority     = "obligatoria",
+            triggered_by = f"IRP={score:.1f}",
+        ))
+
+    if score < 60:
+        conditions.append(Condition(
+            category     = "operational",
+            text         = "Plan de salida documentado con umbrales de activación predefinidos (IRP < 35, crisis política sistémica, cambio de régimen de concesiones)",
+            rationale    = "La incertidumbre del entorno requiere que el inversor tenga definido con anticipación el protocolo de desinversión y los umbrales que lo activan.",
+            priority     = "obligatoria" if score < 50 else "recomendada",
+            triggered_by = f"IRP={score:.1f}",
+        ))
+
+    conf = soc_ind.get("SOC_02")
+    if conf and conf.score and conf.score < 55:
+        conditions.append(Condition(
+            category     = "operational",
+            text         = "Joint venture o acuerdo de asociación estratégica con socio local de reconocida trayectoria en el sector",
+            rationale    = "La conflictividad social identificada se mitiga significativamente cuando el proyecto cuenta con un socio local que aporta legitimidad, conocimiento del entorno y redes de relacionamiento.",
+            priority     = "recomendada",
+            triggered_by = f"Conflictividad social score={conf.score:.1f}",
+        ))
+
+    community = soc_ind.get("SOC_08")
+    if irp.sector == "mining" and community and community.score and community.score < 65:
+        conditions.append(Condition(
+            category     = "operational",
+            text         = "Proceso formal de consulta previa a comunidades bajo el Convenio 169 de la OIT con inicio mínimo 18 meses antes del arranque de operaciones",
+            rationale    = "La presión comunitaria identificada hace del proceso de consulta previa un factor crítico de viabilidad del proyecto, no solo de cumplimiento legal.",
+            priority     = "obligatoria",
+            triggered_by = f"Presión comunitaria score={community.score:.1f} / Sector minería",
+        ))
+
+    return conditions
+
+
+# ─────────────────────────────────────────────────────────────────
+# EFA SUMMARY
+# ─────────────────────────────────────────────────────────────────
+
+def _efa_summary(efa, country, sector):
+    text = (
+        f"Sobre una inversión total de {format_usd(efa.investment_usd)}, "
+        f"la Exposición Financiera Ajustada (EFA) — que estima la pérdida máxima probable "
+        f"en un escenario de estrés político-cambiario combinado — asciende a "
+        f"{format_usd(efa.efa_usd)}, equivalente al {efa.efa_pct:.1f}% del capital invertido. "
+        f"Este cálculo incorpora un factor de riesgo político de {efa.risk_factor:.2f} "
+        f"(derivado del IRP) y una volatilidad cambiaria de {efa.fx_volatility*100:.1f}% "
+        f"observada en los últimos doce meses. "
+        f"La EFA debe ser el referente para dimensionar el seguro de inversión, "
+        f"los montos de las garantías contractuales y el nivel de cobertura cambiaria requerido. "
+    )
+    if efa.rar:
+        if efa.rar >= 2:
+            text += (
+                f"El Retorno Ajustado por Riesgo (RAR) de {efa.rar:.2f}x indica que el retorno "
+                f"esperado más que duplica la exposición máxima estimada, lo que respalda "
+                f"la decisión de inversión desde una perspectiva de riesgo-retorno."
+            )
+        elif efa.rar >= 1:
+            text += (
+                f"El Retorno Ajustado por Riesgo (RAR) de {efa.rar:.2f}x indica que el retorno "
+                f"esperado supera la exposición máxima estimada, lo que sustenta la viabilidad "
+                f"financiera del proyecto bajo condiciones de mitigación adecuadas."
+            )
+        else:
+            text += (
+                f"El Retorno Ajustado por Riesgo (RAR) de {efa.rar:.2f}x indica que el retorno "
+                f"esperado no compensa suficientemente la exposición al riesgo identificada, "
+                f"lo que debilita el caso financiero del proyecto en su configuración actual."
+            )
+    return text
+
+
+# ─────────────────────────────────────────────────────────────────
+# REVISIÓN
+# ─────────────────────────────────────────────────────────────────
+
+def _review_schedule(score, sector, country):
+    if score >= 70:
+        freq    = "anual"
+        detail  = (
+            f"En el caso de {country}, se recomienda realizar una revisión completa del "
+            f"análisis cada doce meses, coincidiendo con la publicación de los nuevos "
+            f"datos del Banco Mundial y el FMI. "
+            f"Adicionalmente, se debe actualizar el análisis de forma inmediata ante los "
+            f"siguientes eventos: elecciones con cambio de gobierno, reformas constitucionales "
+            f"que afecten el régimen de inversión extranjera, crisis económicas con impacto "
+            f"en el tipo de cambio superior al 15% en un período de treinta días, "
+            f"o cambios significativos en el marco regulatorio del sector."
+        )
+    elif score >= 55:
+        freq    = "semestral"
+        detail  = (
+            f"El nivel de riesgo identificado para {country} exige una revisión semestral "
+            f"del análisis, coincidiendo con las publicaciones del FMI World Economic Outlook "
+            f"(abril y octubre). "
+            f"Se debe actualizar el análisis de forma inmediata ante: cualquier cambio de "
+            f"gobierno o de ministros clave del área económica, huelgas sectoriales de "
+            f"duración superior a siete días, cambios en el régimen de royalties o "
+            f"concesiones del sector, o deterioro del rating soberano en dos o más notches."
+        )
+    elif score >= 40:
+        freq    = "trimestral"
+        detail  = (
+            f"El perfil de riesgo de {country} requiere monitoreo trimestral activo. "
+            f"Cada revisión debe incluir: actualización de los indicadores de conflictividad "
+            f"(ACLED), seguimiento del GPR Index mensual, revisión de prensa especializada "
+            f"sobre el sector, y consulta con el socio local o asesor en el país. "
+            f"Cualquier evento político relevante — independientemente del calendario — "
+            f"debe gatillar una revisión inmediata del análisis."
+        )
+    else:
+        freq    = "mensual"
+        detail  = (
+            f"El nivel de riesgo crítico de {country} exige un monitoreo mensual continuo "
+            f"que incluya seguimiento semanal de indicadores de alerta temprana: "
+            f"spread CDS, tipo de cambio, conflictividad ACLED y cobertura de medios "
+            f"internacionales. Se recomienda mantener activo el plan de contingencia "
+            f"y revisar mensualmente los umbrales de activación del plan de salida."
+        )
+
+    return f"Revisión {freq} recomendada. {detail}"
+
+
+def conditions_by_category(rec: RecommendationResult) -> dict:
+    grouped = {"contractual": [], "financial": [], "operational": []}
+    for c in rec.conditions:
+        grouped[c.category].append(c)
+    return grouped
+
+==> ./engine/normalizers.py <==
+# engine/normalizers.py
+# Funciones de normalización para los 40 indicadores.
+# Convierte cualquier valor crudo a una escala 0-100
+# donde 100 = mejor condición para invertir.
+# ─────────────────────────────────────────────────────────────────
+
+
+def normalize_wgi(raw: float) -> float:
+    """
+    Indicadores WGI del Banco Mundial.
+    Escala original: -2.5 (peor) a +2.5 (mejor)
+    Ejemplos: Suecia +1.9 → 88 | Chile +0.8 → 66 | Venezuela -1.5 → 20
+    """
+    raw = max(-2.5, min(2.5, raw))
+    return round(((raw + 2.5) / 5.0) * 100, 2)
+
+
+def normalize_range(value: float, min_val: float,
+                    max_val: float, inverse: bool = False) -> float:
+    """
+    Normalización genérica para cualquier rango.
+    inverse=True cuando más alto = peor (ej: días para registrar empresa)
+    """
+    if max_val == min_val:
+        return 50.0
+    value = max(min_val, min(max_val, value))
+    score = ((value - min_val) / (max_val - min_val)) * 100
+    return round(100 - score if inverse else score, 2)
+
+
+def normalize_inflation(pct: float) -> float:
+    """
+    Inflación anual en %.
+    0% → 100 pts | 50% o más → 0 pts
+    """
+    pct = max(0.0, min(50.0, pct))
+    return round((1 - pct / 50.0) * 100, 2)
+
+
+def normalize_gdp_growth(pct: float) -> float:
+    """
+    Crecimiento del PIB real en %.
+    Rango: -5% (recesión) a +10% (boom)
+    """
+    pct = max(-5.0, min(10.0, pct))
+    return round(((pct + 5.0) / 15.0) * 100, 2)
+
+
+def normalize_debt_gdp(pct: float) -> float:
+    """
+    Deuda pública / PIB en %.
+    0% → 100 pts | 200% → 0 pts
+    """
+    pct = max(0.0, min(200.0, pct))
+    return round((1 - pct / 200.0) * 100, 2)
+
+
+def normalize_sovereign_rating(rating: str) -> float:
+    """
+    Rating soberano S&P a escala 0-100.
+    AAA=100 | A=77 | BBB-=59 | BB=50 | B=36 | D=4
+    """
+    SCORES = {
+        "AAA": 22, "AA+": 21, "AA": 20, "AA-": 19,
+        "A+":  18, "A":   17, "A-":  16,
+        "BBB+":15, "BBB": 14, "BBB-":13,
+        "BB+": 12, "BB":  11, "BB-": 10,
+        "B+":   9, "B":    8, "B-":   7,
+        "CCC+": 6, "CCC":  5, "CCC-": 4,
+        "CC":   3, "C":    2, "D":    1, "NR": 0,
+    }
+    pts = SCORES.get(str(rating).upper().strip(), 0)
+    return round((pts / 22) * 100, 2)
+
+
+def normalize_gpi(gpi: float) -> float:
+    """
+    Global Peace Index.
+    1.0 = más pacífico (mejor) → 100 pts
+    5.0 = menos pacífico (peor) → 0 pts
+    """
+    gpi = max(1.0, min(5.0, gpi))
+    return round((1 - (gpi - 1.0) / 4.0) * 100, 2)
+
+
+def normalize_rsf(rsf: float) -> float:
+    """
+    RSF Libertad de Prensa.
+    0 = máxima libertad → 100 pts
+    100 = sin libertad → 0 pts
+    """
+    rsf = max(0.0, min(100.0, rsf))
+    return round((1 - rsf / 100.0) * 100, 2)
+
+
+def normalize_gpr(gpr: float) -> float:
+    """
+    Índice de Riesgo Geopolítico (GPR).
+    Base 100 = promedio histórico.
+    Más alto = más riesgo geopolítico = peor.
+    Rango típico: 50 (calma) a 500 (crisis geopolítica severa).
+    """
+    gpr = max(0.0, min(500.0, gpr))
+    return round((1 - gpr / 500.0) * 100, 2)
+
+
+def normalize_social_conflicts(events: float) -> float:
+    """
+    Número de eventos de conflictividad social (ACLED) en 12 meses.
+    0 eventos → 100 pts | 500+ eventos → 0 pts
+    """
+    events = max(0.0, min(500.0, events))
+    return round((1 - events / 500.0) * 100, 2)
+
+
+def normalize_manual_risk(value: float, scale: float = 10.0) -> float:
+    """
+    Para indicadores manuales donde más = peor riesgo.
+    0 = sin riesgo → 100 pts | 10 = riesgo máximo → 0 pts
+    Usado en: POL_10 (expropiación), SOC_07, SOC_08
+    """
+    value = max(0.0, min(scale, value))
+    return round((1 - value / scale) * 100, 2)
+
+
+def normalize_manual_opportunity(value: float, scale: float = 10.0) -> float:
+    """
+    Para indicadores manuales donde más = mejor oportunidad.
+    0 = sin oportunidad → 0 pts | 10 = máxima oportunidad → 100 pts
+    Usado en: OPP_04, OPP_05, OPP_06, BIZ_08
+    """
+    value = max(0.0, min(scale, value))
+    return round((value / scale) * 100, 2)
+
+
+# ── MAPA DE FUNCIONES ─────────────────────────────────────────────
+# Relaciona el nombre de la función con la función real.
+# El catálogo de indicadores (indicators.py) referencia estos nombres.
+
+NORMALIZER_MAP = {
+    "normalize_wgi":                normalize_wgi,
+    "normalize_range":              normalize_range,
+    "normalize_inflation":          normalize_inflation,
+    "normalize_gdp_growth":         normalize_gdp_growth,
+    "normalize_debt_gdp":           normalize_debt_gdp,
+    "normalize_sovereign_rating":   normalize_sovereign_rating,
+    "normalize_gpi":                normalize_gpi,
+    "normalize_rsf":                normalize_rsf,
+    "normalize_gpr":                normalize_gpr,
+    "normalize_social_conflicts":   normalize_social_conflicts,
+    "normalize_manual_risk":        normalize_manual_risk,
+    "normalize_manual_opportunity": normalize_manual_opportunity,
+}
+
+
+def apply(indicator_code: str, raw_value, normalizer_name: str,
+          min_val: float = 0.0, max_val: float = 100.0,
+          direction: str = "positive") -> float:
+    """
+    Aplica la función de normalización correcta a un valor crudo.
+    Función principal que usa el motor de scoring.
+
+    Args:
+        indicator_code  : código del indicador (ej: "POL_01")
+        raw_value       : valor crudo de la fuente
+        normalizer_name : nombre de la función (del catálogo)
+        min_val / max_val: rango para normalize_range
+        direction       : "positive" o "negative"
+
+    Returns:
+        score normalizado 0-100
+    """
+    if raw_value is None:
+        return None
+
+    fn = NORMALIZER_MAP.get(normalizer_name)
+    if fn is None:
+        return None
+
+    try:
+        # Funciones con argumentos especiales
+        if normalizer_name == "normalize_range":
+            score = fn(raw_value, min_val, max_val)
+            if direction == "negative":
+                score = 100 - score
+            return score
+
+        elif normalizer_name in ("normalize_manual_risk",
+                                  "normalize_manual_opportunity"):
+            return fn(raw_value, max_val)
+
+        else:
+            return fn(raw_value)
+
+    except Exception:
+        return None
+
+==> ./engine/__init__.py <==
+
+==> ./engine/financial.py <==
+# engine/financial.py
+# Cálculo de la Exposición Financiera Ajustada (EFA) y
+# el Retorno Ajustado por Riesgo (RAR).
+#
+# Estas métricas convierten el IRP en números que entiende
+# directamente el CFO de una empresa.
+# ─────────────────────────────────────────────────────────────────
+
+from dataclasses import dataclass
+from typing import Optional
+
+
+@dataclass
+class EFAResult:
+    """Resultado del análisis de exposición financiera."""
+
+    # Inputs
+    investment_usd:    float          # inversión total en USD
+    irp_score:         float          # IRP del análisis (0-100)
+    fx_volatility:     float          # volatilidad cambiaria (0-1)
+    fx_pair:           Optional[str]  # par de divisas (ej: CLPUSD=X)
+    fx_current:        Optional[float]# tipo de cambio actual
+    fx_min_12m:        Optional[float]# mínimo del año
+    fx_max_12m:        Optional[float]# máximo del año
+    fx_avg_12m:        Optional[float]# promedio del año
+
+    # Outputs calculados
+    risk_factor:       float          # (1 - IRP/100)
+    efa_usd:           float          # Exposición Financiera Ajustada
+    efa_pct:           float          # EFA como % de la inversión
+
+    # Retorno ajustado (opcional, si el cliente da datos)
+    expected_return_usd: Optional[float] = None
+    rar:                 Optional[float] = None  # RAR = retorno/EFA
+    rar_interpretation:  Optional[str]  = None
+
+
+def calculate_efa(
+    investment_usd: float,
+    irp_score:      float,
+    fx_volatility:  Optional[float],
+    fx_data:        Optional[dict] = None,
+) -> EFAResult:
+    """
+    Calcula la Exposición Financiera Ajustada (EFA).
+
+    Fórmula:
+        EFA = Inversión × Volatilidad_cambiaria × (1 - IRP/100)
+
+    Interpretación:
+        Es la pérdida máxima estimada en el peor escenario combinado
+        de riesgo político y colapso cambiario.
+
+    Args:
+        investment_usd : monto total de la inversión en USD
+        irp_score      : score IRP del análisis (0-100)
+        fx_volatility  : volatilidad cambiaria 12m (0-1), o None
+        fx_data        : dict con _fx_current, _fx_range, _fx_pair
+
+    Returns:
+        EFAResult con todos los campos calculados
+    """
+    # Si no hay dato de volatilidad, usamos 0.15 como valor
+    # conservador por defecto (15% es la volatilidad promedio
+    # de monedas emergentes en períodos estables)
+    if fx_volatility is None:
+        fx_volatility = 0.15
+
+    risk_factor = round(1 - irp_score / 100, 4)
+    efa_usd     = round(investment_usd * fx_volatility * risk_factor, 2)
+    efa_pct     = round((efa_usd / investment_usd) * 100, 2) if investment_usd > 0 else 0
+
+    # Datos de tipo de cambio si están disponibles
+    fx_pair    = None
+    fx_current = None
+    fx_min     = None
+    fx_max     = None
+    fx_avg     = None
+
+    if fx_data:
+        fx_pair    = fx_data.get("_fx_pair")
+        fx_current = fx_data.get("_fx_current")
+        fx_range   = fx_data.get("_fx_range")
+        if fx_range:
+            fx_min, fx_max, fx_avg = fx_range
+
+    return EFAResult(
+        investment_usd = investment_usd,
+        irp_score      = irp_score,
+        fx_volatility  = fx_volatility,
+        fx_pair        = fx_pair,
+        fx_current     = fx_current,
+        fx_min_12m     = fx_min,
+        fx_max_12m     = fx_max,
+        fx_avg_12m     = fx_avg,
+        risk_factor    = risk_factor,
+        efa_usd        = efa_usd,
+        efa_pct        = efa_pct,
+    )
+
+
+def calculate_rar(
+    efa_result:          EFAResult,
+    expected_return_usd: float,
+) -> EFAResult:
+    """
+    Agrega el Retorno Ajustado por Riesgo (RAR) a un EFAResult.
+
+    Fórmula:
+        RAR = Retorno_esperado / EFA
+
+    Interpretación:
+        RAR > 2.0 → muy favorable (retorno dobla la exposición)
+        RAR 1.0-2.0 → favorable
+        RAR 0.5-1.0 → marginal (retorno no cubre bien el riesgo)
+        RAR < 0.5 → desfavorable
+
+    Args:
+        efa_result           : resultado previo de calculate_efa
+        expected_return_usd  : retorno anual esperado en USD
+
+    Returns:
+        EFAResult actualizado con RAR
+    """
+    if efa_result.efa_usd == 0:
+        rar = None
+        interpretation = "No calculable (EFA = 0)"
+    else:
+        rar = round(expected_return_usd / efa_result.efa_usd, 2)
+        if rar >= 2.0:
+            interpretation = "MUY FAVORABLE — el retorno más que dobla la exposición al riesgo"
+        elif rar >= 1.0:
+            interpretation = "FAVORABLE — el retorno supera la exposición al riesgo"
+        elif rar >= 0.5:
+            interpretation = "MARGINAL — el retorno no compensa suficientemente el riesgo"
+        else:
+            interpretation = "DESFAVORABLE — la exposición al riesgo supera el retorno esperado"
+
+    efa_result.expected_return_usd = expected_return_usd
+    efa_result.rar                 = rar
+    efa_result.rar_interpretation  = interpretation
+
+    return efa_result
+
+
+def format_usd(amount: float) -> str:
+    """Formatea un monto en USD de forma legible."""
+    if amount >= 1_000_000_000:
+        return f"USD {amount/1_000_000_000:.2f}B"
+    if amount >= 1_000_000:
+        return f"USD {amount/1_000_000:.2f}M"
+    if amount >= 1_000:
+        return f"USD {amount/1_000:.1f}K"
+    return f"USD {amount:.2f}"
+
+==> ./reports/__init__.py <==

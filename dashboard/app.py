@@ -49,8 +49,12 @@ button[kind="header"]{background:rgba(184,137,26,0.2)!important;border:1px solid
 .stTabs [data-baseweb="tab-panel"]{background:var(--white)!important;border:1px solid var(--g200)!important;border-top:none!important;border-radius:0 0 4px 4px!important;padding:1.2rem!important;}
 
 /* ── COMPONENTES ── */
-.app-hdr{display:flex;justify-content:space-between;align-items:center;padding:.8rem 1.5rem;background:var(--navy);border-bottom:1px solid #2A4060;margin-bottom:0;}
-.app-brand{font-family:'DM Serif Display',serif;font-size:1.1rem;color:var(--white);margin:0;}
+.app-hdr{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:center;gap:10px;padding:.8rem 1.5rem;background:var(--navy);border-bottom:1px solid #2A4060;margin-bottom:0;}
+@media (max-width: 768px) {
+    .app-hdr { flex-direction: column; align-items: flex-start; }
+    .app-meta { line-height: 1.4; }
+    .map-legend { flex-wrap: wrap; text-align: center; }
+}.app-brand{font-family:'DM Serif Display',serif;font-size:1.1rem;color:var(--white);margin:0;}
 .app-brand span{color:var(--gold);}
 .app-meta{font-size:.63rem;color:var(--silver);font-family:'DM Mono',monospace;letter-spacing:.06em;}
 .kpi{background:var(--white);border:1px solid var(--g200);border-top:3px solid var(--navy);padding:.9rem 1.1rem;border-radius:2px;}
@@ -306,8 +310,7 @@ fig_map.update_layout(
              showcountries=True,countrycolor="#2A4060",bgcolor="#0F1E35",
              projection_type="natural earth"),
     paper_bgcolor="#0F1E35",plot_bgcolor="#0F1E35",
-    margin=dict(l=0,r=0,t=0,b=0),height=440,showlegend=False,
-    dragmode="pan",
+margin=dict(l=0,r=0,t=20,b=20),height=350,autosize=True,showlegend=False,    dragmode="pan",
 )
 
 # Capturar clic en el mapa
